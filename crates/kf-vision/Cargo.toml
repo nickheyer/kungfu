@@ -1,0 +1,17 @@
+[package]
+name = "kf-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+kf-core.workspace = true
+kf-gguf.workspace = true
+kf-quant.workspace = true
+
+[dev-dependencies]
+kf-backend-cpu.workspace = true
+kf-backend-cuda.workspace = true

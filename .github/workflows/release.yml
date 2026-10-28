@@ -1,0 +1,58 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.backend }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x86_64, backend: cpu, runner: ubuntu-24.04, args: --no-default-features }
+          - { os: linux, arch: x86_64, backend: cuda, runner: ubuntu-24.04, args: --features kf-backend-cuda/embed-ptx, cuda: "12.8.1" }
+          - { os: linux, arch: aarch64, backend: cpu, runner: ubuntu-24.04-arm, args: --no-default-features }
+          - { os: windows, arch: x86_64, backend: cpu, runner: windows-2022, args: --no-default-features }
+          - { os: windows, arch: x86_64, backend: cuda, runner: windows-2022, args: --features kf-backend-cuda/embed-ptx, cuda: "12.8.1" }
+          - { os: macos, arch: arm64, backend: cpu, runner: macos-14, args: --no-default-features }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the CUDA toolkit for nvcc
+        if: matrix.cuda != ''
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc"]'
+      - name: Check the tag against the crate version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          test "$tag" = "$crate" || { echo "tag $tag is not the crate version $crate"; exit 1; }
+      - name: Build
+        shell: bash
+        run: cargo build --release -p kungfu ${{ matrix.args }}
+      - name: Package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="kungfu-${version}-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.backend }}"
+          mkdir -p "dist/$name"
+          if [ "${{ matrix.os }}" = windows ]; then
+            cp target/release/kungfu.exe "dist/$name/"
+          else
+            cp target/release/kungfu "dist/$name/"
+          fi
+          "dist/$name/kungfu"* --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz

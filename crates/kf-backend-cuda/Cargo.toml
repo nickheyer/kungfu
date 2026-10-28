@@ -1,0 +1,21 @@
+[package]
+name = "kf-backend-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+embed-ptx = []
+
+[dependencies]
+anyhow.workspace = true
+cudarc.workspace = true
+kf-core.workspace = true
+kf-quant.workspace = true
+kf-backend-cpu.workspace = true
+sha2 = "0.10"
+half.workspace = true
+
+[dev-dependencies]
+kf-gguf.workspace = true

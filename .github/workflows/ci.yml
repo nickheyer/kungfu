@@ -1,0 +1,16 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p kungfu --no-default-features
+      - run: cargo test --workspace --exclude kf-backend-cuda --no-default-features
+      - run: cargo check --workspace --all-targets

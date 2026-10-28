@@ -1,0 +1,9 @@
+[package]
+name = "kf-layers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+kf-core.workspace = true

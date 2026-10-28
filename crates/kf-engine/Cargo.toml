@@ -1,0 +1,26 @@
+[package]
+name = "kf-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cuda"]
+cuda = ["dep:kf-backend-cuda"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+kf-core.workspace = true
+kf-gguf.workspace = true
+kf-quant.workspace = true
+kf-layers.workspace = true
+kf-arch.workspace = true
+kf-backend-cpu.workspace = true
+kf-backend-cuda = { workspace = true, optional = true }
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+libloading = "0.9"
+
+[dev-dependencies]
+serde_json.workspace = true
