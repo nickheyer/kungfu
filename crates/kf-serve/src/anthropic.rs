@@ -345,7 +345,7 @@ fn stream_events(rx: mpsc::Receiver<Piece>, parser: StreamParser, id: String, mo
                 return None;
             }
             match st.rx.recv().await {
-                Some(Piece::Text(piece)) => match st.parser.feed(&piece) {
+                Some(Piece::Text(piece, _)) => match st.parser.feed(&piece) {
                     Ok(deltas) => {
                         for d in deltas {
                             st.delta(d);

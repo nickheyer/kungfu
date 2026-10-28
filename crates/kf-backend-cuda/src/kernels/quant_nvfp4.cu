@@ -17,6 +17,17 @@ struct Nvfp4 {
 #pragma unroll
         for (int i = 0; i < 8; i++) v[i] = (float)kvalues_fp4[(qs[i] >> sh) & 0xF] * d;
     }
+
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        d = ue4m3_half(b[g]);
+        m = 0.0f;
+        const u8* qs = b + 4 + 8 * g;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            q[j] = kvalues_fp4[qs[j] & 0xF];
+            q[j + 8] = kvalues_fp4[qs[j] >> 4];
+        }
+    }
 };
 
-KF_QUANT_KERNELS(Nvfp4)
+KF_QUANT_KERNELS_I8(Nvfp4)

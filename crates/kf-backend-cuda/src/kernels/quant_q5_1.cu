@@ -14,6 +14,15 @@ struct Q5_1 {
             v[i] = (float)q * d + m;
         }
     }
+
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        d = kf_f16(b);
+        m = -kf_f16(b + 2);
+        u32 qh = kf_u32(b + 4);
+        int sh = g * 4;
+#pragma unroll
+        for (int j = 0; j < 16; j++) q[j] = (i8)(((u32)(b[8 + j] >> sh) & 0xF) | (g ? ((qh >> (j + 12)) & 0x10) : (((qh >> j) << 4) & 0x10)));
+    }
 };
 
-KF_QUANT_KERNELS(Q5_1)
+KF_QUANT_KERNELS_I8(Q5_1)

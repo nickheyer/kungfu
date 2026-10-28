@@ -51,6 +51,16 @@ pub const QUANT_MODULES: &[(&str, &str)] = &[
     ("q2_0", include_str!("kernels/quant_q2_0.cu")),
 ];
 
+/// Quant types whose kernel file gives q16 and so the matmul_i8 tensor core entry, every block type but the floats
+pub const INT8_TYPES: &[&str] = &[
+    "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q8_1", "q2_K", "q3_K", "q4_K", "q5_K", "q6_K", "q8_K", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl", "iq3_s", "iq2_s", "iq4_xs", "iq1_m", "tq1_0", "tq2_0", "mxfp4", "nvfp4", "q1_0", "q2_0",
+];
+
+/// Whether the quant module of a ggml type has the int8 tensor core product
+pub fn has_int8(ggml_type: u32) -> bool {
+    kf_quant::info(ggml_type).is_some_and(|i| INT8_TYPES.contains(&i.name))
+}
+
 /// Module name of the quant kernels for a ggml type id, none when no kernel file exists
 pub fn quant_module(ggml_type: u32) -> Option<String> {
     let name = kf_quant::info(ggml_type)?.name;

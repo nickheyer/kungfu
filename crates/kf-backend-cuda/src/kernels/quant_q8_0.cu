@@ -12,6 +12,15 @@ struct Q8_0 {
             v[2 * i + 1] = (float)(i8)(p >> 8) * d;
         }
     }
+
+    // Sixteen integers of half g with the block scale, no offset
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        d = kf_f16(b);
+        m = 0.0f;
+        const u8* p = b + 2 + 16 * g;
+#pragma unroll
+        for (int j = 0; j < 16; j++) q[j] = (i8)p[j];
+    }
 };
 
-KF_QUANT_KERNELS(Q8_0)
+KF_QUANT_KERNELS_I8(Q8_0)

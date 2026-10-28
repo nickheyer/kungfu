@@ -3,7 +3,7 @@ use crate::api::Metrics;
 use crate::grammar::Constraint;
 use crate::tokenizer::Tok;
 use kf_vision::{Clip, ImageInput};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use kf_core::event;
 use kf_engine::{Rng, RoutingProfile, Sampling, Session, sample};
 use serde_json::{Value, json};
@@ -23,6 +23,15 @@ pub struct Limits {
     pub bias: Vec<(u32, f32)>,
 }
 
+/// The log probability of one generated token under the model with the most likely tokens at that position
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    /// The most likely tokens with their log probabilities, most likely first
+    pub top: Vec<(u32, f32)>,
+}
+
 /// What came out of one generation
 #[derive(Clone, Debug)]
 pub struct Outcome {
@@ -33,10 +42,13 @@ pub struct Outcome {
     pub finish: &'static str,
     /// The stop string that ended the generation, when one did
     pub stop_sequence: Option<String>,
+    /// One entry per generated token kept in the text, empty when the request asked for none
+    pub logprobs: Vec<TokenLogprob>,
 }
 
+/// A piece of text with the log probabilities of the tokens that completed inside it
 pub enum Piece {
-    Text(String),
+    Text(String, Vec<TokenLogprob>),
     Done(Outcome),
     Failed(String),
 }
@@ -63,6 +75,8 @@ pub struct Job {
     pub think_budget: Option<usize>,
     /// Whether the prompt left a think block open
     pub thinking_open: bool,
+    /// How many most likely tokens to report beside each token's own log probability, none when not asked
+    pub logprobs: Option<usize>,
     pub cancel: Arc<AtomicBool>,
     pub tx: mpsc::Sender<Piece>,
 }
@@ -115,6 +129,49 @@ pub fn choose(logits: &[f32], sampling: &Sampling, recent: &[u32], rng: &mut Rng
         return Ok(None);
     }
     bail!("no token of the vocabulary continues the grammar")
+}
+
+/// The log probability of one token under the raw logits with the n_top most likely tokens, ties broken by lower id
+pub fn logprob_entry(logits: &[f32], token: u32, n_top: usize) -> TokenLogprob {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max + (logits.iter().map(|v| f64::from(v - max).exp()).sum::<f64>().ln() as f32);
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(n_top + 1);
+    if n_top > 0 {
+        for (i, &v) in logits.iter().enumerate() {
+            if top.len() < n_top || v > top[top.len() - 1].1 {
+                let at = top.partition_point(|(_, t)| *t >= v);
+                top.insert(at, (i as u32, v));
+                if top.len() > n_top {
+                    top.pop();
+                }
+            }
+        }
+    }
+    let lp = |v: f32| if v == f32::NEG_INFINITY { v } else { v - lse };
+    let own = logits.get(token as usize).copied().unwrap_or(f32::NEG_INFINITY);
+    TokenLogprob { token, logprob: lp(own), top: top.into_iter().map(|(i, v)| (i, lp(v))).collect() }
+}
+
+/// Entries whose token ended at or before byte end, from the first unsent one, moving the sent mark past them
+fn take_logprobs(lp: &[(usize, TokenLogprob)], sent: &mut usize, end: usize) -> Vec<TokenLogprob> {
+    let n = lp[*sent..].iter().take_while(|(e, _)| *e <= end).count();
+    let out = lp[*sent..*sent + n].iter().map(|(_, e)| e.clone()).collect();
+    *sent += n;
+    out
+}
+
+/// Drops the entries of tokens that began at or after byte at, keeping every entry already sent
+fn trim_logprobs(lp: &mut Vec<(usize, TokenLogprob)>, sent: usize, at: usize) {
+    let mut start = 0;
+    let mut keep = 0;
+    for (end, _) in lp.iter() {
+        if start >= at {
+            break;
+        }
+        keep += 1;
+        start = *end;
+    }
+    lp.truncate(keep.max(sent));
 }
 
 pub enum SlotAction {
@@ -215,6 +272,12 @@ struct Active {
     constraint: Option<Constraint>,
     think_open: bool,
     think_count: usize,
+    /// Log probability of every token in out with the byte length of text once it was appended
+    lp: Vec<(usize, TokenLogprob)>,
+    /// How many lp entries went out with text pieces
+    lp_sent: usize,
+    /// Log probabilities of the verified tokens still waiting in pending, in their order
+    lp_pending: VecDeque<TokenLogprob>,
 }
 
 struct Scheduler {
@@ -334,7 +397,7 @@ impl Scheduler {
             let job = &self.waiting[i];
             if job.cancel.load(Ordering::Relaxed) {
                 let job = self.waiting.remove(i).expect("waiting job");
-                let _ = job.tx.blocking_send(Piece::Done(Outcome { text: String::new(), n_prompt: job.ids.len(), cached: 0, n_out: 0, finish: "cancelled", stop_sequence: None }));
+                let _ = job.tx.blocking_send(Piece::Done(Outcome { text: String::new(), n_prompt: job.ids.len(), cached: 0, n_out: 0, finish: "cancelled", stop_sequence: None, logprobs: Vec::new() }));
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -360,7 +423,7 @@ impl Scheduler {
                 Ok(cached) => {
                     let constraint = job.constraint.take();
                     let think_open = job.thinking_open;
-                    self.active.push(Active { job, slot, t0, prefill_done: None, cached, fed: cached, logits: None, out: Vec::new(), text: String::new(), sent: 0, rng: Rng::new(seed), pending: VecDeque::new(), forced: VecDeque::new(), rounds: 0, accepted: 0, next: None, finish: None, stop_sequence: None, constraint, think_open, think_count: 0 });
+                    self.active.push(Active { job, slot, t0, prefill_done: None, cached, fed: cached, logits: None, out: Vec::new(), text: String::new(), sent: 0, rng: Rng::new(seed), pending: VecDeque::new(), forced: VecDeque::new(), rounds: 0, accepted: 0, next: None, finish: None, stop_sequence: None, constraint, think_open, think_count: 0, lp: Vec::new(), lp_sent: 0, lp_pending: VecDeque::new() });
                 }
                 Err(e) => {
                     let _ = job.tx.blocking_send(Piece::Failed(format!("{e:#}")));
@@ -488,31 +551,53 @@ impl Scheduler {
                 let mut con = a.constraint.clone();
                 let first = a.out.is_empty();
                 let mut seen = 0usize;
+                let want = a.job.logprobs;
+                let mut lps: Vec<TokenLogprob> = Vec::new();
                 let (sampling, bias, rng) = (&a.job.sampling, &a.job.limits.bias, &mut a.rng);
                 let mut chooser = |l: &[f32], recent: &[u32]| -> Result<u32> {
                     let t = choose(l, sampling, recent, rng, bias, &mut con, &tok, first && seen == 0)?.unwrap_or(eos);
+                    if let Some(n) = want {
+                        lps.push(logprob_entry(l, t, n));
+                    }
                     seen += 1;
                     Ok(t)
                 };
                 let accepted = kf_engine::verify(&mut self.session, slot, &drafted, &mut chooser)?;
                 a.accepted += accepted.len() as u64 - 1;
+                if want.is_some() {
+                    ensure!(lps.len() == accepted.len(), "{} log probabilities for {} verified tokens", lps.len(), accepted.len());
+                    a.lp_pending.extend(lps);
+                }
                 a.pending.extend(accepted);
                 a.constraint = con;
             }
         }
         let a = &mut self.active[i];
         let first = a.out.is_empty();
+        let want = a.job.logprobs;
+        let mut entry = None;
         let next = if let Some(t) = a.forced.pop_front() {
             if let Some(con) = &mut a.constraint {
                 let Some(next) = con.try_advance(self.tok.piece(t, first)) else { bail!("the forced end of reasoning does not fit the grammar") };
                 *con = next;
             }
+            if let Some(n) = want {
+                let l = a.logits.as_deref().ok_or_else(|| anyhow!("no logits for the forced token"))?;
+                entry = Some(logprob_entry(l, t, n));
+            }
             Some(t)
         } else if let Some(t) = a.pending.pop_front() {
+            if want.is_some() {
+                entry = Some(a.lp_pending.pop_front().ok_or_else(|| anyhow!("no log probability for the verified token"))?);
+            }
             Some(t)
         } else {
             let l = a.logits.take().ok_or_else(|| anyhow!("no logits to sample from"))?;
-            choose(&l, &a.job.sampling, &a.out, &mut a.rng, &a.job.limits.bias, &mut a.constraint, &self.tok, first)?
+            let t = choose(&l, &a.job.sampling, &a.out, &mut a.rng, &a.job.limits.bias, &mut a.constraint, &self.tok, first)?;
+            if let (Some(n), Some(t)) = (want, t) {
+                entry = Some(logprob_entry(&l, t, n));
+            }
+            t
         };
         a.logits = None;
         let Some(next) = next else {
@@ -525,6 +610,9 @@ impl Scheduler {
         }
         a.out.push(next);
         a.text = self.tok.decode(&a.out)?;
+        if let Some(e) = entry {
+            a.lp.push((a.text.len(), e));
+        }
         let opened = a.text.rfind(THINK_OPEN).map_or(a.job.thinking_open, |o| a.text[o..].rfind(THINK_CLOSE).is_none());
         let closed = a.text.rfind(THINK_CLOSE).is_some_and(|c| a.text[c..].rfind(THINK_OPEN).is_none());
         a.think_open = opened && !closed;
@@ -534,12 +622,14 @@ impl Scheduler {
         if let Some((at, st)) = a.job.limits.stop.iter().filter_map(|st| a.text.find(st.as_str()).map(|i| (i, st))).min_by_key(|(i, _)| *i) {
             a.stop_sequence = Some(st.clone());
             a.text.truncate(at);
+            trim_logprobs(&mut a.lp, a.lp_sent, at);
             a.finish = Some("stop");
             return Ok(());
         }
         let safe = safe_len(&a.text, &a.job.limits.stop);
         if safe > a.sent {
-            if a.job.tx.blocking_send(Piece::Text(a.text[a.sent..safe].to_string())).is_err() {
+            let lps = take_logprobs(&a.lp, &mut a.lp_sent, safe);
+            if a.job.tx.blocking_send(Piece::Text(a.text[a.sent..safe].to_string(), lps)).is_err() {
                 a.finish = Some("cancelled");
                 return Ok(());
             }
@@ -598,8 +688,9 @@ impl Scheduler {
                     let _ = self.session.truncate(a.slot, keep);
                 }
             }
-            if a.text.len() > a.sent {
-                let _ = a.job.tx.blocking_send(Piece::Text(a.text[a.sent..].to_string()));
+            if a.text.len() > a.sent || a.lp.len() > a.lp_sent {
+                let rest = a.lp[a.lp_sent..].iter().map(|(_, e)| e.clone()).collect();
+                let _ = a.job.tx.blocking_send(Piece::Text(a.text[a.sent..].to_string(), rest));
             }
             let n_prompt = a.job.ids.len();
             let n_out = a.out.len();
@@ -620,8 +711,43 @@ impl Scheduler {
             if finish == "cancelled" {
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
             }
-            let _ = a.job.tx.blocking_send(Piece::Done(Outcome { text: a.text, n_prompt, cached: a.cached, n_out, finish, stop_sequence: a.stop_sequence }));
+            let logprobs = a.lp.into_iter().map(|(_, e)| e).collect();
+            let _ = a.job.tx.blocking_send(Piece::Done(Outcome { text: a.text, n_prompt, cached: a.cached, n_out, finish, stop_sequence: a.stop_sequence, logprobs }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logprob_entry_is_log_softmax_with_ordered_top() {
+        let logits = [1.0f32, 3.0, 2.0, 3.0, f32::NEG_INFINITY];
+        let e = logprob_entry(&logits, 2, 3);
+        let lse = (1f32.exp() + 3f32.exp() + 2f32.exp() + 3f32.exp()).ln();
+        assert!((e.logprob - (2.0 - lse)).abs() < 1e-6);
+        assert_eq!(e.top.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 3, 2]);
+        assert!((e.top[0].1 - (3.0 - lse)).abs() < 1e-6);
+        assert_eq!(logprob_entry(&logits, 4, 0).logprob, f32::NEG_INFINITY);
+        assert!(logprob_entry(&logits, 4, 0).top.is_empty());
+    }
+
+    #[test]
+    fn logprobs_follow_text_pieces_and_stop_trimming() {
+        let e = |t: u32| TokenLogprob { token: t, logprob: 0.0, top: Vec::new() };
+        let mut lp = vec![(2, e(0)), (5, e(1)), (5, e(2)), (9, e(3))];
+        let mut sent = 0;
+        assert_eq!(take_logprobs(&lp, &mut sent, 4).len(), 1);
+        assert_eq!(take_logprobs(&lp, &mut sent, 5).len(), 2);
+        assert_eq!(sent, 3);
+        trim_logprobs(&mut lp, sent, 7);
+        assert_eq!(lp.len(), 4);
+        trim_logprobs(&mut lp, sent, 5);
+        assert_eq!(lp.len(), 3);
+        let mut lp2 = vec![(2, e(0)), (5, e(1))];
+        trim_logprobs(&mut lp2, 0, 0);
+        assert!(lp2.is_empty());
     }
 }
 

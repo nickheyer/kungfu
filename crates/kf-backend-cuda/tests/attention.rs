@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use kf_backend_cpu::CpuBackend;
-use kf_core::{Backend, Graph, GraphBuilder, Inputs, LayerPlan, Op, Plan, Pool, Wid};
+use kf_core::{Backend, Graph, GraphBuilder, Inputs, LayerPlan, Op, Plan, Pool, SwaType, Wid, Window};
 
 const N_EMBD: usize = 64;
 const N_HEAD: usize = 4;
@@ -131,4 +131,60 @@ fn vision_ops_and_attend_ahead_match_reference() {
 
 fn graph_attend(m: &Model) -> Graph {
     graph(m)
+}
+
+const N_HEAD_W: usize = 8;
+const N_HEAD_KV_W: usize = 4;
+const HD_W: usize = 8;
+
+struct Wide {
+    w: Mem,
+    table: Wid,
+    wq: Wid,
+    wk: Wid,
+    wv: Wid,
+    sinks: Wid,
+}
+
+fn wide(seed: u64) -> Wide {
+    let mut rng = Rng(seed);
+    let mut w = Mem::default();
+    let table = w.f32("table", &[N_EMBD, 64], &rng.vec(64 * N_EMBD, 1.0));
+    let wq = w.f32("wq", &[N_EMBD, N_HEAD_W * HD_W], &rng.vec(N_EMBD * N_HEAD_W * HD_W, 0.25));
+    let wk = w.f32("wk", &[N_EMBD, N_HEAD_KV_W * HD_W], &rng.vec(N_EMBD * N_HEAD_KV_W * HD_W, 0.25));
+    let wv = w.f32("wv", &[N_EMBD, N_HEAD_KV_W * HD_W], &rng.vec(N_EMBD * N_HEAD_KV_W * HD_W, 0.25));
+    let sinks = w.f32("sinks", &[N_HEAD_W], &rng.vec(N_HEAD_W, 1.0));
+    Wide { w, table, wq, wk, wv, sinks }
+}
+
+fn wide_graph(m: &Wide, window: Option<Window>, sinks: bool) -> Graph {
+    let mut g = GraphBuilder::new();
+    let tokens = g.input("tokens");
+    let x = g.push(Op::Embed { weight: m.table }, &[tokens]);
+    g.layer = Some(0);
+    let q = g.push(Op::MatMul { weight: m.wq, bias: None, scale: None }, &[x]);
+    let k = g.push(Op::MatMul { weight: m.wk, bias: None, scale: None }, &[x]);
+    let v = g.push(Op::MatMul { weight: m.wv, bias: None, scale: None }, &[x]);
+    let a = g.push(Op::Attention { layer: 0, n_head: N_HEAD_W, n_head_kv: N_HEAD_KV_W, head_dim: HD_W, head_dim_v: HD_W, scale: 0.35, window, softcap: 0.0, sinks: sinks.then_some(m.sinks), alibi_bias: 0.0, kv_source: None, top_k: None }, &[q, k, v]);
+    g.finish(a)
+}
+
+/// Prefill passes with enough rows and heads run attention undivided, plain and with a window and sinks, and the divided decode steps after them agree too
+#[test]
+fn undivided_and_windowed_attention_match_reference() {
+    let m = wide(0xC0FFEE);
+    for (what, window, sinks) in [("plain", None, false), ("windowed with sinks", Some(Window { size: 64, kind: SwaType::Standard }), true)] {
+        let g = wide_graph(&m, window, sinks);
+        let mut cpu = CpuBackend::new();
+        cpu.apply_plan(&plan(Pool::Host, 0)).expect("cpu plan");
+        let mut gpu = cuda();
+        gpu.apply_plan(&plan(Pool::Device(0), 0)).expect("cuda plan");
+        for c in 0..3 {
+            both(&format!("{what} chunk {c}"), &g, &run_inputs(&[(0, c * N_BATCH, N_BATCH)]), &m.w, &mut cpu, &mut gpu, 2e-2);
+        }
+        both(&format!("{what} slot one"), &g, &run_inputs(&[(1, 0, N_BATCH)]), &m.w, &mut cpu, &mut gpu, 2e-2);
+        for s in 0..2 {
+            both(&format!("{what} decode {s}"), &g, &run_inputs(&[(0, 3 * N_BATCH + s, 1), (1, N_BATCH + s, 1)]), &m.w, &mut cpu, &mut gpu, 2e-2);
+        }
+    }
 }

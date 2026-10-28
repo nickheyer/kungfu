@@ -26,6 +26,19 @@ struct Q4K {
             v[4 + i] = d1 * (float)((w.y >> (8 * i + sh)) & 0xF) - m1;
         }
     }
+
+    // Sixteen group g is half l0 of sub block two j plus hi
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        int j = g >> 2, hi = (g >> 1) & 1, l0 = (g & 1) * 16;
+        int sc, mi;
+        scale_min(2 * j + hi, b + 4, sc, mi);
+        d = kf_f16(b) * (float)sc;
+        m = kf_f16(b + 2) * (float)mi;
+        const u8* p = b + 16 + 32 * j + l0;
+        int sh = hi * 4;
+#pragma unroll
+        for (int i = 0; i < 16; i++) q[i] = (i8)((p[i] >> sh) & 0xF);
+    }
 };
 
-KF_QUANT_KERNELS(Q4K)
+KF_QUANT_KERNELS_I8(Q4K)

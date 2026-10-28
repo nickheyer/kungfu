@@ -131,6 +131,138 @@ __device__ void kf_matmul(const u8* __restrict__ w, const float* __restrict__ x,
     kf_mm_tile<T>(w, row_bytes, x, bias, y, n, n_out, rows_s, rows_s);
 }
 
+// Int8 tensor core tile. Weights give sixteen integers per group with w = d * q - m, activations arrive as int8 with a scale and
+// an integer sum per sixteen columns, so each sixteen wide step is one exact integer product scaled once:
+// sum w x = d dx sum(q qx) - m dx sum(qx)
+#define KF_I8_BM 64
+#define KF_I8_BN 64
+#define KF_I8_BK 64
+#define KF_I8_LD (KF_I8_BK + 16)
+#define KF_I8_G (KF_I8_BK / 16)
+
+// One 16 by 8 by 16 int8 product into four int32 lanes, zero accumulator, the Ampere fragment layout
+__device__ __forceinline__ void kf_mma_i8(int* c, u32 a0, u32 a1, u32 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b), "r"(0));
+#else
+    c[0] = c[1] = c[2] = c[3] = 0;
+    __trap();
+#endif
+}
+
+template <typename T>
+__device__ void kf_mm_tile_i8(const u8* __restrict__ w, i64 row_bytes, const i8* __restrict__ xq, const float* __restrict__ xs, const int* __restrict__ xsum, const float* __restrict__ bias, float* __restrict__ y, int n, int n_out, const int* xrow, const int* yrow) {
+    __shared__ __align__(16) i8 Xs[KF_I8_BM][KF_I8_LD];
+    __shared__ __align__(16) i8 Ws[KF_I8_BN][KF_I8_LD];
+    __shared__ float dxs[KF_I8_BM][KF_I8_G], sxs[KF_I8_BM][KF_I8_G];
+    __shared__ float dws[KF_I8_BN][KF_I8_G], mws[KF_I8_BN][KF_I8_G];
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    int wm = warp >> 1, wn = warp & 1;
+    int o0 = blockIdx.x * KF_I8_BN;
+    int n16 = n >> 4;
+    float acc[2][4][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[mi][ni][e] = 0.0f;
+    for (int k0 = 0; k0 < n; k0 += KF_I8_BK) {
+#pragma unroll
+        for (int it = 0; it < 2; it++) {
+            int c = tid + 128 * it, r = c >> 2, kc = (c & 3) * 16, xr = xrow[r];
+            int4 v = make_int4(0, 0, 0, 0);
+            if (xr >= 0 && k0 + kc < n) v = *reinterpret_cast<const int4*>(xq + (i64)xr * n + k0 + kc);
+            *reinterpret_cast<int4*>(&Xs[r][kc]) = v;
+            int gi = c & 3, k16 = (k0 >> 4) + gi;
+            float d = 0.0f, s = 0.0f;
+            if (xr >= 0 && k16 < n16) {
+                i64 at = (i64)xr * n16 + k16;
+                d = xs[at];
+                s = d * (float)xsum[at];
+            }
+            dxs[r][gi] = d;
+            sxs[r][gi] = s;
+            int oo = c >> 2, o = o0 + oo, k = k0 + 16 * gi;
+            __align__(16) i8 q[16];
+            float dw = 0.0f, mw = 0.0f;
+            if (o < n_out && k < n) {
+                T::q16(w + (i64)o * row_bytes + (i64)(k / T::QK) * T::BYTES, (k % T::QK) >> 4, q, dw, mw);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 16; j++) q[j] = 0;
+            }
+            *reinterpret_cast<int4*>(&Ws[oo][16 * gi]) = *reinterpret_cast<const int4*>(q);
+            dws[oo][gi] = dw;
+            mws[oo][gi] = mw;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < KF_I8_G; ks++) {
+            u32 a[2][2], b[4];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                int r = wm * 32 + mi * 16 + g;
+                a[mi][0] = *reinterpret_cast<const u32*>(&Xs[r][ks * 16 + 4 * t]);
+                a[mi][1] = *reinterpret_cast<const u32*>(&Xs[r + 8][ks * 16 + 4 * t]);
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ni++) b[ni] = *reinterpret_cast<const u32*>(&Ws[wn * 32 + ni * 8 + g][ks * 16 + 4 * t]);
+            float dxr[2][2], sxr[2][2];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                int r = wm * 32 + mi * 16 + g;
+                dxr[mi][0] = dxs[r][ks];
+                dxr[mi][1] = dxs[r + 8][ks];
+                sxr[mi][0] = sxs[r][ks];
+                sxr[mi][1] = sxs[r + 8][ks];
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ni++) {
+                int c0 = wn * 32 + ni * 8 + 2 * t;
+                float dw0 = dws[c0][ks], dw1 = dws[c0 + 1][ks], mw0 = mws[c0][ks], mw1 = mws[c0 + 1][ks];
+#pragma unroll
+                for (int mi = 0; mi < 2; mi++) {
+                    int c[4];
+                    kf_mma_i8(c, a[mi][0], a[mi][1], b[ni]);
+                    acc[mi][ni][0] += (float)c[0] * (dxr[mi][0] * dw0) - mw0 * sxr[mi][0];
+                    acc[mi][ni][1] += (float)c[1] * (dxr[mi][0] * dw1) - mw1 * sxr[mi][0];
+                    acc[mi][ni][2] += (float)c[2] * (dxr[mi][1] * dw0) - mw0 * sxr[mi][1];
+                    acc[mi][ni][3] += (float)c[3] * (dxr[mi][1] * dw1) - mw1 * sxr[mi][1];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            int yr = yrow[wm * 32 + mi * 16 + g + 8 * h];
+            if (yr < 0) continue;
+#pragma unroll
+            for (int ni = 0; ni < 4; ni++) {
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    int o = o0 + wn * 32 + ni * 8 + 2 * t + j;
+                    if (o < n_out) y[(i64)yr * n_out + o] = acc[mi][ni][2 * h + j] + (bias ? bias[o] : 0.0f);
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+__device__ void kf_matmul_i8(const u8* __restrict__ w, const i8* __restrict__ xq, const float* __restrict__ xs, const int* __restrict__ xsum, const float* __restrict__ bias, float* __restrict__ y, int rows, int n, int n_out, i64 row_bytes) {
+    __shared__ int rows_s[KF_I8_BM];
+    int r0 = blockIdx.y * KF_I8_BM;
+    if (threadIdx.x < KF_I8_BM) rows_s[threadIdx.x] = r0 + (int)threadIdx.x < rows ? r0 + (int)threadIdx.x : -1;
+    __syncthreads();
+    kf_mm_tile_i8<T>(w, row_bytes, xq, xs, xsum, bias, y, n, n_out, rows_s, rows_s);
+}
+
 template <typename T>
 __device__ void kf_embed(const u8* __restrict__ w, const int* __restrict__ tokens, float* __restrict__ out, int n, int n_tok, i64 row_bytes) {
     int ng = (n + 7) / 8;
@@ -200,4 +332,11 @@ __device__ void kf_moe_matmul(const u8* __restrict__ base, i64 expert_bytes, i64
     }                                                                                                                                                        \
     extern "C" __global__ void moe_matmul(const u8* base, i64 expert_bytes, i64 row_bytes, const int* order, const int* offsets, const float* x, int x_per_slot, float* y, int n, int n_out, int n_used) { \
         kf_moe_matmul<T>(base, expert_bytes, row_bytes, order, offsets, x, x_per_slot, y, n, n_out, n_used);                                                 \
+    }
+
+// The int8 tensor core product, for types whose struct gives q16, listed on the host in INT8_TYPES
+#define KF_QUANT_KERNELS_I8(T)                                                                                                                                 \
+    KF_QUANT_KERNELS(T)                                                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(128) matmul_i8(const u8* w, const i8* xq, const float* xs, const int* xsum, const float* bias, float* y, int rows, int n, int n_out, i64 row_bytes) { \
+        kf_matmul_i8<T>(w, xq, xs, xsum, bias, y, rows, n, n_out, row_bytes);                                                                                  \
     }

@@ -197,10 +197,7 @@ fn held_back(buf: &str) -> usize {
     let bytes = buf.as_bytes();
     (1..=bytes.len().min(12))
         .rev()
-        .find(|n| {
-            let tail = &buf[buf.len() - n..];
-            buf.is_char_boundary(buf.len() - n) && TAGS.iter().any(|t| t.starts_with(tail))
-        })
+        .find(|n| buf.is_char_boundary(buf.len() - n) && TAGS.iter().any(|t| t.starts_with(&buf[buf.len() - n..])))
         .unwrap_or(0)
 }
 

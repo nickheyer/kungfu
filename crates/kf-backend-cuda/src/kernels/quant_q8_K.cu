@@ -12,6 +12,14 @@ struct Q8K {
             for (int k = 0; k < 4; k++) v[4 * i + k] = d * (float)(i8)((p >> (8 * k)) & 0xFF);
         }
     }
+
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        d = __int_as_float((int)kf_u32(b));
+        m = 0.0f;
+        const u8* p = b + 4 + 16 * g;
+#pragma unroll
+        for (int j = 0; j < 16; j++) q[j] = (i8)p[j];
+    }
 };
 
-KF_QUANT_KERNELS(Q8K)
+KF_QUANT_KERNELS_I8(Q8K)

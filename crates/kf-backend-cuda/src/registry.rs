@@ -186,8 +186,8 @@ pub fn cuda_kernel_for_op(registry: &KernelRegistry, op: &Op) -> Option<KernelRe
     let found = match op {
         Op::Input { .. } => fixed(&[("elementwise", "input_f32")]),
         Op::Embed { .. } => Some(KernelRef { fixed: &[], quant: &["embed"] }),
-        Op::MatMul { scale: None, .. } => Some(KernelRef { fixed: &[("elementwise", "round_act")], quant: &["matvec", "matmul", "dequant"] }),
-        Op::MatMul { scale: Some(_), .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("elementwise", "scale")], quant: &["matvec", "matmul", "dequant"] }),
+        Op::MatMul { scale: None, .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("elementwise", "quant_act")], quant: &["matvec", "matmul", "dequant"] }),
+        Op::MatMul { scale: Some(_), .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("elementwise", "quant_act"), ("elementwise", "scale")], quant: &["matvec", "matmul", "dequant"] }),
         Op::RmsNorm { .. } => Some(KernelRef { fixed: &[("norm", "rms_norm")], quant: &["dequant"] }),
         Op::LayerNorm { .. } => Some(KernelRef { fixed: &[("norm", "layer_norm")], quant: &["dequant"] }),
         Op::L2Norm { .. } => fixed(&[("norm", "l2_norm")]),

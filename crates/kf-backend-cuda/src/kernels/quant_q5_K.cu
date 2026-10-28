@@ -27,6 +27,19 @@ struct Q5K {
             v[i] = d1 * (float)q - m1;
         }
     }
+
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        int j = g >> 2, hi = (g >> 1) & 1, l0 = (g & 1) * 16;
+        int sc, mi;
+        scale_min(2 * j + hi, b + 4, sc, mi);
+        d = kf_f16(b) * (float)sc;
+        m = kf_f16(b + 2) * (float)mi;
+        const u8* qh = b + 16 + l0;
+        const u8* ql = b + 48 + 32 * j + l0;
+        u8 u = (u8)(1u << (2 * j + hi));
+#pragma unroll
+        for (int i = 0; i < 16; i++) q[i] = (i8)((hi ? (ql[i] >> 4) : (ql[i] & 0xF)) + ((qh[i] & u) ? 16 : 0));
+    }
 };
 
-KF_QUANT_KERNELS(Q5K)
+KF_QUANT_KERNELS_I8(Q5K)

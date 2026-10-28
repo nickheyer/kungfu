@@ -2,7 +2,7 @@
 mod exec;
 mod experts;
 mod registry;
-mod sources;
+pub mod sources;
 
 use anyhow::{Context, Result, anyhow};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};

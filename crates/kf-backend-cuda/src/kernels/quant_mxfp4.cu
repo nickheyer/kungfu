@@ -14,6 +14,15 @@ struct Mxfp4 {
 #pragma unroll
         for (int i = 0; i < 8; i++) v[i] = (float)kvalues_fp4[(b[1 + j0 + i] >> sh) & 0xF] * d;
     }
+
+    // The fp4 table holds doubled values and the scale is halved, so the table entries are the integers
+    static __device__ __forceinline__ void q16(const u8* b, int g, i8* q, float& d, float& m) {
+        d = e8m0_half(b[0]);
+        m = 0.0f;
+        int sh = g * 4;
+#pragma unroll
+        for (int j = 0; j < 16; j++) q[j] = kvalues_fp4[(b[1 + j] >> sh) & 0xF];
+    }
 };
 
-KF_QUANT_KERNELS(Mxfp4)
+KF_QUANT_KERNELS_I8(Mxfp4)

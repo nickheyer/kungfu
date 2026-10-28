@@ -103,6 +103,8 @@ pub struct ChatSpec {
     pub logit_bias: Vec<(u32, f32)>,
     pub chat_template_kwargs: Map<String, Value>,
     pub id_slot: Option<usize>,
+    /// Most likely tokens to report beside each generated token's log probability, none when not asked
+    pub logprobs: Option<usize>,
 }
 
 impl ChatSpec {
@@ -125,6 +127,7 @@ impl ChatSpec {
             logit_bias: Vec::new(),
             chat_template_kwargs: Map::new(),
             id_slot: None,
+            logprobs: None,
         }
     }
 }
@@ -146,12 +149,13 @@ pub struct Prepared {
     pub constraint: Option<Constraint>,
     pub think_budget: Option<usize>,
     pub n_prompt: usize,
+    pub logprobs: Option<usize>,
 }
 
 impl Prepared {
     /// The job of this prepared request with the channel its pieces travel on
     pub fn job(self, slot: Option<usize>, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Piece>) -> Job {
-        Job { ids: self.ids, chunks: self.chunks, sampling: self.sampling, limits: self.limits, slot, constraint: self.constraint, think_budget: self.think_budget, thinking_open: self.thinking_open, cancel, tx }
+        Job { ids: self.ids, chunks: self.chunks, sampling: self.sampling, limits: self.limits, slot, constraint: self.constraint, think_budget: self.think_budget, thinking_open: self.thinking_open, logprobs: self.logprobs, cancel, tx }
     }
 }
 
@@ -232,7 +236,7 @@ pub fn prepare(s: &Served, spec: &ChatSpec) -> Result<Prepared> {
         let root = if bare { Node::Seq(vec![Node::Space, node]) } else { Node::Seq(vec![prelude, Node::Space, node]) };
         Constraint::new(b.finish(root))
     });
-    Ok(Prepared { n_prompt: ids.len(), ids, chunks, prompt, thinking_open, sampling, limits, constraint, think_budget })
+    Ok(Prepared { n_prompt: ids.len(), ids, chunks, prompt, thinking_open, sampling, limits, constraint, think_budget, logprobs: spec.logprobs })
 }
 
 /// The name and parameter schema of one OpenAI shaped tool

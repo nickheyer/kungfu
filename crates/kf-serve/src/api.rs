@@ -1,6 +1,6 @@
 use crate::chat::{self, ChatSpec, ResponseFormat, ToolChoice};
 use crate::describe::{STOP_GRACE_SECONDS, describe};
-use crate::engine::{Cmd, DraftConn, Engine, Outcome, Piece, SlotAction};
+use crate::engine::{Cmd, DraftConn, Engine, Outcome, Piece, SlotAction, TokenLogprob};
 use crate::params::{Ctx, Launch};
 use crate::parse::{Delta, Format, StreamParser, parse_output};
 use crate::template::{ChatTemplate, Message};
@@ -147,7 +147,14 @@ pub struct ChatRequest {
     /// The one sequence slot this seat keeps, as the relay gateway names it
     #[serde(default)]
     pub id_slot: Option<usize>,
+    #[serde(default)]
+    pub logprobs: bool,
+    #[serde(default)]
+    pub top_logprobs: Option<usize>,
 }
+
+/// Most alternatives a request may ask for beside each token, the OpenAI bound
+pub const TOP_LOGPROBS_MAX: usize = 20;
 
 /// An error already logged as an error event
 #[derive(Debug)]
@@ -673,7 +680,33 @@ fn chat_spec(req: &ChatRequest) -> Result<ChatSpec> {
     spec.logit_bias = chat::logit_bias(req.logit_bias.as_ref())?;
     spec.chat_template_kwargs = req.chat_template_kwargs.clone();
     spec.id_slot = req.id_slot;
+    spec.logprobs = match (req.logprobs, req.top_logprobs) {
+        (false, None) => None,
+        (false, Some(_)) => return Err(anyhow!("top_logprobs needs logprobs true")),
+        (true, None) => Some(0),
+        (true, Some(n)) if n <= TOP_LOGPROBS_MAX => Some(n),
+        (true, Some(n)) => return Err(anyhow!("top_logprobs is {n}, at most {TOP_LOGPROBS_MAX}")),
+    };
     Ok(spec)
+}
+
+/// One token as the logprobs content lists it, its text, log probability, bytes, and the most likely alternatives
+fn logprob_json(tok: &Tok, e: &TokenLogprob) -> Value {
+    let one = |id: u32, lp: f32| {
+        let bytes = tok.piece(id, false);
+        json!({ "token": String::from_utf8_lossy(bytes), "logprob": lp, "bytes": bytes })
+    };
+    let mut v = one(e.token, e.logprob);
+    v["top_logprobs"] = Value::Array(e.top.iter().map(|(id, lp)| one(*id, *lp)).collect());
+    v
+}
+
+/// The logprobs object of a choice, the entries under content, null when the request asked for none
+fn logprobs_json(tok: &Tok, entries: &[TokenLogprob], wanted: bool) -> Value {
+    if !wanted {
+        return Value::Null;
+    }
+    json!({ "content": entries.iter().map(|e| logprob_json(tok, e)).collect::<Vec<Value>>(), "refusal": Value::Null })
 }
 
 /// Starts a generation for a spec and hands back its piece channel with the prepared prompt facts
@@ -693,9 +726,10 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resu
     let spec = chat_spec(&req)?;
     let id = format!("chatcmpl-{}", s.metrics.requests.fetch_add(1, Ordering::Relaxed) + 1);
     let (rx, guard, thinking_open, _) = start(&s, &spec)?;
+    let wanted = spec.logprobs.is_some();
     if req.stream {
         let parser = StreamParser::new(s.format, thinking_open);
-        let stream = stream_events(rx, parser, id, s.model_name.clone(), guard);
+        let stream = stream_events(rx, parser, id, s.model_name.clone(), s.tok.clone(), wanted, guard);
         return Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response());
     }
     let out = collect(rx).await?;
@@ -711,6 +745,7 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resu
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": parsed.content, "reasoning_content": parsed.reasoning, "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) } },
+            "logprobs": logprobs_json(&s.tok, &out.logprobs, wanted),
             "finish_reason": finish
         }],
         "usage": usage(&out)
@@ -726,7 +761,7 @@ pub fn now_secs() -> u64 {
 pub async fn collect(mut rx: mpsc::Receiver<Piece>) -> Result<Outcome> {
     while let Some(p) = rx.recv().await {
         match p {
-            Piece::Text(_) => {}
+            Piece::Text(..) => {}
             Piece::Done(o) => return Ok(o),
             Piece::Failed(m) => return Err(anyhow!("{m}")),
         }
@@ -743,14 +778,27 @@ struct StreamState {
     parser: StreamParser,
     id: String,
     model: String,
+    tok: Arc<Tok>,
+    /// Whether the request asked for logprobs, so every chunk carries a logprobs object
+    wanted: bool,
+    /// Logprobs received with text the parser has not yet released as a delta
+    carry: Vec<TokenLogprob>,
     saw_tool: bool,
     done: bool,
     pending: std::collections::VecDeque<Event>,
     _guard: CancelOnDrop,
 }
 
-fn chunk(id: &str, model: &str, delta: Value, finish: Option<&str>, usage: Option<Value>) -> Event {
-    let mut body = json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] });
+impl StreamState {
+    /// The logprobs object of the next chunk, the carried entries when asked for, null otherwise
+    fn take_logprobs(&mut self) -> Value {
+        let entries = std::mem::take(&mut self.carry);
+        logprobs_json(&self.tok, &entries, self.wanted)
+    }
+}
+
+fn chunk(id: &str, model: &str, delta: Value, logprobs: Value, finish: Option<&str>, usage: Option<Value>) -> Event {
+    let mut body = json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish }] });
     if let Some(u) = usage {
         body["usage"] = u;
     }
@@ -758,20 +806,21 @@ fn chunk(id: &str, model: &str, delta: Value, finish: Option<&str>, usage: Optio
 }
 
 fn delta_event(st: &mut StreamState, d: Delta) -> Event {
+    let lp = st.take_logprobs();
     match d {
-        Delta::Reasoning(r) => chunk(&st.id, &st.model, json!({ "reasoning_content": r }), None, None),
-        Delta::Content(c) => chunk(&st.id, &st.model, json!({ "content": c }), None, None),
+        Delta::Reasoning(r) => chunk(&st.id, &st.model, json!({ "reasoning_content": r }), lp, None, None),
+        Delta::Content(c) => chunk(&st.id, &st.model, json!({ "content": c }), lp, None, None),
         Delta::ToolCall(c) => {
             st.saw_tool = true;
             let idx = c.id.trim_start_matches("call_").parse::<usize>().unwrap_or(0);
-            chunk(&st.id, &st.model, json!({ "tool_calls": [{ "index": idx, "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.arguments } }] }), None, None)
+            chunk(&st.id, &st.model, json!({ "tool_calls": [{ "index": idx, "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.arguments } }] }), lp, None, None)
         }
     }
 }
 
 /// Server sent events of parsed deltas, a finishing chunk with the usage, then the done marker
-fn stream_events(rx: mpsc::Receiver<Piece>, parser: StreamParser, id: String, model: String, guard: CancelOnDrop) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    let st = StreamState { rx, parser, id, model, saw_tool: false, done: false, pending: Default::default(), _guard: guard };
+fn stream_events(rx: mpsc::Receiver<Piece>, parser: StreamParser, id: String, model: String, tok: Arc<Tok>, wanted: bool, guard: CancelOnDrop) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    let st = StreamState { rx, parser, id, model, tok, wanted, carry: Vec::new(), saw_tool: false, done: false, pending: Default::default(), _guard: guard };
     futures_util::stream::unfold(st, |mut st| async move {
         loop {
             if let Some(e) = st.pending.pop_front() {
@@ -781,8 +830,9 @@ fn stream_events(rx: mpsc::Receiver<Piece>, parser: StreamParser, id: String, mo
                 return None;
             }
             match st.rx.recv().await {
-                Some(Piece::Text(piece)) => match st.parser.feed(&piece) {
+                Some(Piece::Text(piece, lps)) => match st.parser.feed(&piece) {
                     Ok(deltas) => {
+                        st.carry.extend(lps);
                         for d in deltas {
                             let e = delta_event(&mut st, d);
                             st.pending.push_back(e);
@@ -809,7 +859,8 @@ fn stream_events(rx: mpsc::Receiver<Piece>, parser: StreamParser, id: String, mo
                         }
                     }
                     let finish = if st.saw_tool { "tool_calls" } else { out.as_ref().map_or("stop", |o| o.finish) };
-                    st.pending.push_back(chunk(&st.id, &st.model, json!({}), Some(finish), out.as_ref().map(usage)));
+                    let lp = st.take_logprobs();
+                    st.pending.push_back(chunk(&st.id, &st.model, json!({}), lp, Some(finish), out.as_ref().map(usage)));
                     st.pending.push_back(Event::default().data("[DONE]"));
                     st.done = true;
                 }

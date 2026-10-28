@@ -179,6 +179,59 @@ extern "C" __global__ void round_act(const float* x, float* out, int n, int kind
     orow[c] = d * fminf(rintf(iscale * v), 127.0f);
 }
 
+// The int8 form of round_act for kinds 3 and 4, the same integers and block scales the rounding would multiply back together.
+// q holds rows of n int8, scales and sums hold one entry per sixteen columns, the scale of the block and the integer sum of the sixteen.
+extern "C" __global__ void quant_act(const float* x, i8* q, float* scales, int* sums, int n, int kind) {
+    __shared__ float sa[256];
+    __shared__ int si[256];
+    int tid = threadIdx.x, c0 = blockIdx.x * 256, c = c0 + tid;
+    const float* xr = x + (i64)blockIdx.y * n;
+    i8* qrow = q + (i64)blockIdx.y * n;
+    int n16 = n >> 4;
+    float* srow = scales + (i64)blockIdx.y * n16;
+    int* mrow = sums + (i64)blockIdx.y * n16;
+    float v = c < n ? xr[c] : 0.0f;
+    int qi = 0;
+    float d = 0.0f;
+    if (kind == 3) {
+        float amax = kf_warp_max(fabsf(v));
+        float dd = amax / 127.0f;
+        float id = dd != 0.0f ? 1.0f / dd : 0.0f;
+        d = kf_round_f16(dd);
+        qi = (int)roundf(v * id);
+    } else {
+        sa[tid] = c < n ? fabsf(v) : -1.0f;
+        si[tid] = tid;
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (tid < s) {
+                float oa = sa[tid + s];
+                int oi = si[tid + s];
+                if (oa > sa[tid] || (oa == sa[tid] && oi < si[tid])) {
+                    sa[tid] = oa;
+                    si[tid] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        if (sa[0] > 0.0f) {
+            float mx = xr[c0 + si[0]];
+            float iscale = -127.0f / mx;
+            d = 1.0f / iscale;
+            qi = (int)fminf(rintf(iscale * v), 127.0f);
+        }
+    }
+    int sum = qi;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (c < n) {
+        qrow[c] = (i8)qi;
+        if ((tid & 15) == 0) {
+            srow[c >> 4] = d;
+            mrow[c >> 4] = sum;
+        }
+    }
+}
+
 // Mean of every kernel by kernel block of a side by side grid of rows, raster order in and out
 extern "C" __global__ void pool_grid(const float* x, float* out, int side, int kernel, int cols) {
     int o = side / kernel;

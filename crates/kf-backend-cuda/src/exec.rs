@@ -1,6 +1,7 @@
 use crate::CudaBackend;
 use crate::experts;
 use crate::registry::{KernelRegistry, cuda_kernel_for_op};
+use crate::sources;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cudarc::driver::{CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg, result, sys};
 use kf_core::{Act, AllocKind, Gating, Graph, Inputs, Node, Op, Plan, Pool, RopeKind, RopeParams, Tid, WeightNorm, WeightSource, Wid};
@@ -849,6 +850,18 @@ fn ensure_stage(b: &mut CudaBackend, kw: usize, vw: usize) -> Result<()> {
     Ok(())
 }
 
+/// Keys one block of resident attention covers when a pass has too few rows to fill the device
+const AT_PART: usize = 128;
+/// Rows times heads from which resident attention runs undivided, one block per row and head
+const AT_BLOCKS: usize = 256;
+/// Widest value row the attention kernels accumulate in registers
+const AT_V_MAX: usize = 512;
+
+/// Parts the key range of resident attention splits into, one for a pass with enough blocks and the ring in parts otherwise
+fn attention_parts(rows: usize, n_head: usize, cap: usize) -> usize {
+    if rows * n_head >= AT_BLOCKS { 1 } else { cap.div_ceil(AT_PART).max(1) }
+}
+
 /// A partials buffer of at least n floats
 fn ensure_parts(b: &mut CudaBackend, n: usize) -> Result<u64> {
     if b.res.parts.as_ref().is_none_or(|p| p.len() < n) {
@@ -952,11 +965,12 @@ fn run_stream_attention(b: &mut CudaBackend, p: &mut Prepared, i: usize, inputs:
     let clear = flat(b.kernels.function("attention", "attention_clear")?, n_parts * rows * n_head * width, vec![P(parts), Arg::L((n_parts * rows * n_head * width) as i64), I(width as i32)]);
     clear.run(&stream)?;
     let part_fn = b.kernels.function("attention", "attention_part")?;
-    let smem = ((head_dim + 8 + 4 * 512) * 4) as u32;
+    ensure!(*head_dim_v <= AT_V_MAX, "attention value width {head_dim_v} past the {AT_V_MAX} the device kernel holds");
+    let smem = ((head_dim + 8 + 4 * AT_V_MAX) * 4) as u32;
     let launch_part = |kb: u64, vb: u64, row0: usize, n_rows: usize, base: usize, ring: usize, jlo: usize, jhi: usize, part: usize| -> Result<()> {
         let l = Launch {
             func: part_fn.clone(),
-            grid: (n_rows as u32, *n_head as u32, head_dim_v.div_ceil(512) as u32),
+            grid: (n_rows as u32, *n_head as u32, 1),
             block: 128,
             smem,
             args: vec![P(q), P(kb), P(vb), P(p.pos_ptr), P(p.seq_ptr), P(p.att_ptr), I(row0 as i32), I(base as i32), I(ring as i32), I(jlo as i32), I(jhi as i32), P(parts), I(part as i32), I(rows as i32), I(*n_head as i32), I(*n_head_kv as i32), I(*head_dim as i32), I(*head_dim_v as i32), F(*scale), I(window.map_or(0, |w| w.size) as i32), F(*softcap)],
@@ -1033,7 +1047,7 @@ fn ensure_node(b: &mut CudaBackend, p: &Prepared, i: usize, inputs: &Inputs, wei
             let key = p.rope_keys[i].as_deref().context("rope key")?;
             ensure_rope(b, key, params, *head_dim, weights)?;
         }
-        Op::Attention { layer, n_head_kv, head_dim, head_dim_v, sinks, window, .. } => {
+        Op::Attention { layer, n_head, n_head_kv, head_dim, head_dim_v, sinks, window, .. } => {
             let rows = p.shape(node.inputs[0])?.0;
             ensure!(rows == inputs.tokens.len(), "attention over {rows} rows for a pass of {} tokens", inputs.tokens.len());
             let add = appended.entry(*layer).or_default();
@@ -1045,6 +1059,11 @@ fn ensure_node(b: &mut CudaBackend, p: &Prepared, i: usize, inputs: &Inputs, wei
             }
             let extra = add.clone();
             ensure_kv(b, *layer, n_head_kv * head_dim, n_head_kv * head_dim_v, &extra, window.map(|w| w.size))?;
+            let cap = b.res.kv.get(layer).map_or(0, |kv| kv.cap);
+            let n_parts = attention_parts(rows, *n_head, cap);
+            if n_parts > 1 {
+                ensure_parts(b, n_parts * rows * n_head * (2 + head_dim_v))?;
+            }
             if let Some(s) = sinks {
                 ensure_vec(b, *s, weights)?;
             }
@@ -1070,6 +1089,22 @@ fn ensure_node(b: &mut CudaBackend, p: &Prepared, i: usize, inputs: &Inputs, wei
 /// Rows a warp level product handles before the tiled product takes over
 pub(crate) const MATVEC_ROWS: usize = 8;
 
+/// Compute capability from which the int8 tensor core product runs, the mma shape it uses is Ampere's
+const INT8_ARCH: u32 = 80;
+
+/// Whether a product of rows against a weight type takes the int8 tensor core path on this device
+pub(crate) fn int8_path(k: &KernelRegistry, ty: u32, rows: usize, n_in: usize) -> bool {
+    rows > MATVEC_ROWS && k.arch() >= INT8_ARCH && sources::has_int8(ty) && n_in.is_multiple_of(16)
+}
+
+/// The int8 activation scratch laid out in one float buffer of rows times n, the int8 rows then the scales then the sums per sixteen
+fn int8_scratch(base: u64, rows: usize, n: usize) -> (u64, u64, u64) {
+    let q = base;
+    let scales = base + (rows * n) as u64;
+    let sums = scales + (rows * n / 16 * 4) as u64;
+    (q, scales, sums)
+}
+
 /// Activation rounding then a matrix vector product for a few rows or a shared memory tiled product
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_launch(k: &mut KernelRegistry, weights: &dyn WeightSource, w: Wid, w_ptr: u64, bias: u64, x: u64, xq: u64, y: u64, rows: usize) -> Result<Vec<Launch>> {
@@ -1079,6 +1114,20 @@ pub(crate) fn matmul_launch(k: &mut KernelRegistry, weights: &dyn WeightSource, 
     let n_out: usize = d.iter().skip(1).product::<usize>().max(1);
     let rb = row_bytes(ty, n_in)? as i64;
     let mut v = Vec::with_capacity(2);
+    if int8_path(k, ty, rows, n_in) {
+        let code = round_code(ty)?;
+        ensure!(matches!(code, 3 | 4), "int8 product against a type with activation rounding {code}");
+        let (q, scales, sums) = int8_scratch(xq, rows, n_in);
+        v.push(Launch { func: k.function("elementwise", "quant_act")?, grid: (n_in.div_ceil(256) as u32, rows as u32, 1), block: 256, smem: 0, args: vec![Arg::P(x), Arg::P(q), Arg::P(scales), Arg::P(sums), Arg::I(n_in as i32), Arg::I(code)] });
+        v.push(Launch {
+            func: k.quant_function(ty, "matmul_i8")?,
+            grid: (n_out.div_ceil(64) as u32, rows.div_ceil(64) as u32, 1),
+            block: 128,
+            smem: 0,
+            args: vec![Arg::P(w_ptr), Arg::P(q), Arg::P(scales), Arg::P(sums), Arg::P(bias), Arg::P(y), Arg::I(rows as i32), Arg::I(n_in as i32), Arg::I(n_out as i32), Arg::L(rb)],
+        });
+        return Ok(v);
+    }
     let x = rounded(k, ty, x, xq, rows, n_in, &mut v)?;
     v.push(if rows <= MATVEC_ROWS {
         Launch {
@@ -1331,16 +1380,19 @@ fn device_launches(b: &mut CudaBackend, p: &Prepared, i: usize, weights: &dyn We
             Ok(vec![flat(b.kernels.function("rope", "rope")?, rows * cols, args)])
         }
         Op::Attention { layer, n_head, n_head_kv, head_dim, head_dim_v, scale, window, softcap, sinks, .. } => {
+            ensure!(*head_dim_v <= AT_V_MAX, "attention value width {head_dim_v} past the {AT_V_MAX} the device kernel holds");
             let kv = b.res.kv.get(layer).with_context(|| format!("no cache for layer {layer}"))?;
             let (kc, vc) = (dptr(&kv.k, &b.stream), dptr(&kv.v, &b.stream));
             let (kw, vw, cap) = (kv.kw, kv.vw, kv.cap);
             let sk = sinks.map(|w| b.res.vec(w)).transpose()?.unwrap_or(0);
             let append = flat(b.kernels.function("attention", "kv_append")?, rows * (kw + vw), vec![P(x(1)?), P(x(2)?), P(kc), P(vc), P(p.pos_ptr), P(p.seq_ptr), I(rows as i32), I(kw as i32), I(vw as i32), I(cap as i32)]);
+            let n_parts = attention_parts(rows, *n_head, cap);
+            let parts = if n_parts > 1 { dptr(b.res.parts.as_ref().context("attention partials")?, &b.stream) } else { 0 };
             let attend = Launch {
                 func: b.kernels.function("attention", "attention")?,
-                grid: (rows as u32, *n_head as u32, head_dim_v.div_ceil(512) as u32),
+                grid: (rows as u32, *n_head as u32, n_parts as u32),
                 block: 128,
-                smem: ((head_dim + 8 + 4 * 512) * 4) as u32,
+                smem: ((head_dim + 8 + 4 * AT_V_MAX) * 4) as u32,
                 args: vec![
                     P(x(0)?),
                     P(kc),
@@ -1350,6 +1402,8 @@ fn device_launches(b: &mut CudaBackend, p: &Prepared, i: usize, weights: &dyn We
                     P(p.att_ptr),
                     P(sk),
                     P(out),
+                    P(parts),
+                    I(AT_PART as i32),
                     I(*n_head as i32),
                     I(*n_head_kv as i32),
                     I(*head_dim as i32),
@@ -1360,7 +1414,11 @@ fn device_launches(b: &mut CudaBackend, p: &Prepared, i: usize, weights: &dyn We
                     I(cap as i32),
                 ],
             };
-            Ok(vec![append, attend])
+            let mut v = vec![append, attend];
+            if n_parts > 1 {
+                v.push(Launch { func: b.kernels.function("attention", "attention_merge")?, grid: (rows as u32, *n_head as u32, 1), block: 256, smem: 0, args: vec![P(parts), I(n_parts as i32), I(rows as i32), P(sk), P(out), I(*n_head as i32), I(*head_dim_v as i32)] });
+            }
+            Ok(v)
         }
         Op::MoeFfn { gate_exps, up_exps, down_exps, .. } => {
             let d = moe_dims(&node.op, p.shape(node.inputs[0])?, 0, weights)?;

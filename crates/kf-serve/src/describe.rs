@@ -119,7 +119,7 @@ pub fn describe() -> Value {
             "health": "/health",
             "describe": "/describe",
             "metrics": "/metrics",
-            "chat_fields": ["tools", "tool_choice", "reasoning_effort", "chat_template_kwargs", "seed", "stop", "max_tokens", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "logit_bias", "response_format", "stream", "id_slot"],
+            "chat_fields": ["tools", "tool_choice", "reasoning_effort", "chat_template_kwargs", "seed", "stop", "max_tokens", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "logit_bias", "response_format", "logprobs", "top_logprobs", "stream", "id_slot"],
             "response_format": ["text", "json_object", "json_schema"],
             "images": { "parts": ["image_url"], "urls": ["data", "http", "https"], "needs": "--mmproj", "projectors": ["qwen2vl_merger", "gemma3"] },
             "tool_choice": ["auto", "none", "required", "function"],
