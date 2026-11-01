@@ -19,4 +19,19 @@ struct Iq4Nl {
     }
 };
 
+// Word form: the sixteen nibble bytes of the block as one load, each word through the table
+template <>
+struct KfQ16<Iq4Nl> {
+    static __device__ __forceinline__ void load(const u8* __restrict__ b, int g, int4& wv, float& d, float& m) {
+        d = kf_f16(b);
+        m = 0.0f;
+        int sh = g * 4;
+        int4 r = kf_ld16(b + 2);
+        wv.x = (int)kf_iq4nl4(((u32)r.x >> sh) & 0x0F0F0F0Fu);
+        wv.y = (int)kf_iq4nl4(((u32)r.y >> sh) & 0x0F0F0F0Fu);
+        wv.z = (int)kf_iq4nl4(((u32)r.z >> sh) & 0x0F0F0F0Fu);
+        wv.w = (int)kf_iq4nl4(((u32)r.w >> sh) & 0x0F0F0F0Fu);
+    }
+};
+
 KF_QUANT_KERNELS_I8(Iq4Nl)

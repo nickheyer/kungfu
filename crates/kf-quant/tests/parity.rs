@@ -165,3 +165,39 @@ fn dot_row_matches_dequant_then_dot() {
         }
     }
 }
+
+#[test]
+fn dot_i8_matches_dequant_then_dot() {
+    let mut rng = Rng(0x6465_7175_616e_7474);
+    for name in FIXTURES {
+        let q = quant(name);
+        let fx = load(name);
+        let kind = kf_quant::act_kind(q);
+        let rows = 3;
+        let x: Vec<f32> = (0..rows * fx.n).map(|_| 2.0 * rng.unit() - 1.0).collect();
+        let act = kf_quant::quantize_activations(kind, &x, rows).unwrap_or_else(|| panic!("{name}: no int8 activations for {} columns", fx.n));
+        let row_bytes = q.info().row_bytes(fx.n);
+        let mut deq = vec![0.0f32; fx.n];
+        let mut y = vec![0.0f32; rows];
+        for r in 0..fx.rows.min(4) {
+            let src = &fx.raw[r * row_bytes..(r + 1) * row_bytes];
+            q.dequant_row(src, &mut deq);
+            q.dot_i8(src, &act, &mut y);
+            for a in 0..rows {
+                let xa = act.dequant_row(a);
+                let (mut want, mut mag) = (0.0f64, 0.0f64);
+                for (w, v) in deq.iter().zip(&xa) {
+                    let p = *w as f64 * *v as f64;
+                    want += p;
+                    mag += p.abs();
+                }
+                if !want.is_finite() {
+                    assert!(!y[a].is_finite(), "{name} weight row {r} activation row {a}: dot_i8 {} where the reference is {want}", y[a]);
+                    continue;
+                }
+                let err = (y[a] as f64 - want).abs();
+                assert!(err <= 1e-4 * mag + 1e-6, "{name} weight row {r} activation row {a}: dot_i8 {} reference {want} error {err} magnitude {mag}", y[a]);
+            }
+        }
+    }
+}

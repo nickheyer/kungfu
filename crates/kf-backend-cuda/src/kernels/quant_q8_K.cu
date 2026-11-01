@@ -22,4 +22,10 @@ struct Q8K {
     }
 };
 
+// The f32 block scale has a full mantissa, so the product recovers each group sum before scaling
+template <>
+struct KfWide<Q8K> {
+    static constexpr bool V = true;
+};
+
 KF_QUANT_KERNELS_I8(Q8K)

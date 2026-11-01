@@ -1069,10 +1069,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "half",
  "kf-arch",
+ "kf-backend-cpu",
  "kf-core",
  "kf-engine",
  "kf-gguf",
+ "kf-layers",
  "kf-quant",
  "kf-serve",
  "serde_json",

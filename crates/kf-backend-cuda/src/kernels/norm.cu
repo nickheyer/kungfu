@@ -12,6 +12,19 @@ extern "C" __global__ void rms_norm(const float* x, const float* w, const float*
     for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * (inv * (w ? w[i] : 1.0f)) + (b ? b[i] : 0.0f);
 }
 
+// Root mean square normalization per row with its weight and bias, then the residual row added, one block per row
+extern "C" __global__ void rms_norm_add(const float* x, const float* w, const float* b, const float* res, float* out, int cols, float eps) {
+    __shared__ float scratch[32];
+    const float* xr = x + (i64)blockIdx.x * cols;
+    const float* rr = res + (i64)blockIdx.x * cols;
+    float* orow = out + (i64)blockIdx.x * cols;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xr[i] * xr[i];
+    s = kf_block_sum(s, scratch);
+    float inv = 1.0f / sqrtf(s / (float)cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * (inv * (w ? w[i] : 1.0f)) + (b ? b[i] : 0.0f) + rr[i];
+}
+
 // Each row over the square root of its squared sum plus eps
 extern "C" __global__ void l2_norm(const float* x, float* out, int cols, float eps) {
     __shared__ float scratch[32];

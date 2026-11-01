@@ -252,7 +252,7 @@ impl StageRunner {
             ensure!(past + range.len() <= self.n_ctx, "{} tokens past a context of {}", past + range.len(), self.n_ctx);
         }
         let graph = self.graph(tokens.len())?;
-        let inputs = Inputs { tokens: tokens.to_vec(), positions: positions.to_vec(), seqs: seqs.to_vec(), hidden, hidden_cols: cols, rope, attend };
+        let inputs = Inputs { tokens: tokens.to_vec(), positions: positions.to_vec(), seqs: seqs.to_vec(), hidden, hidden_cols: cols, rope, attend, tree: Vec::new() };
         let out = self.backend.run(&graph, &inputs, self.store.as_ref())?;
         for (seq, range) in runs {
             self.n_past[seq] += range.len();

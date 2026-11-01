@@ -13,10 +13,10 @@ pub mod wire;
 pub use launch::{CtxChoice, Prepared, RoutingProfile, prepare};
 pub use loader::{LoadError, Loaded, Store, load};
 pub use plan::{CTX_MIN, CTX_STEP, LayerBytes, PlanDoc, PlacementDoc, PoolDoc, ResidentDoc, Scope, ctx_auto, host_memory, is_expert, layer_bytes, outside_bytes, plan, plan_device_placement, plan_with, pool_memory, state_bytes, state_need_bytes};
-pub use sampler::{Rng, Sampling, sample};
-pub use session::{Rows, Session};
+pub use sampler::{Candidates, Rng, Sampling, sample, sample_sparse};
+pub use session::{Rows, Session, tree_depths};
 pub use stage::{Link, StageConn, StageRunner, admitted, serve_stage};
-pub use speculative::{Chooser, Drafter, verify};
+pub use speculative::{Chooser, Drafter, NGRAM_TOPS, Ngram, Tree, verify, verify_tree};
 
 use anyhow::{Result, bail};
 use kf_core::Backend;

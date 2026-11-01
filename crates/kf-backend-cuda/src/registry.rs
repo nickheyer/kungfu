@@ -2,7 +2,7 @@ use crate::sources;
 use anyhow::{Context, Result, anyhow};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::{CompileError, CompileOptions, Ptx, compile_ptx_with_opts};
-use kf_core::{Act, Gating, Op, RopeKind, Selection, SwaType, WeightNorm};
+use kf_core::{Act, Gating, Op, Selection, SwaType, WeightNorm};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -25,28 +25,47 @@ pub struct KernelRef {
 pub struct KernelRegistry {
     ctx: Arc<CudaContext>,
     arch: u32,
+    sms: usize,
     cache_dir: Option<PathBuf>,
     modules: HashMap<String, Arc<CudaModule>>,
     functions: HashMap<(String, String), CudaFunction>,
     extra: HashMap<String, String>,
+    /// Module and entry of every loaded function by its driver handle, for traces
+    names: HashMap<usize, String>,
+    /// Dynamic shared memory limit already raised per function
+    raised: HashMap<(String, String), u32>,
 }
 
 impl KernelRegistry {
     pub fn new(ctx: Arc<CudaContext>, cache_dir: Option<&Path>) -> Result<Self> {
         let (major, minor) = ctx.compute_capability().context("compute capability")?;
+        let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).context("multiprocessor count")? as usize;
         Ok(Self {
             ctx,
             arch: (major * 10 + minor) as u32,
+            sms,
             cache_dir: cache_dir.map(Path::to_path_buf),
             modules: HashMap::new(),
             functions: HashMap::new(),
             extra: HashMap::new(),
+            names: HashMap::new(),
+            raised: HashMap::new(),
         })
     }
 
     /// Compute capability as major times ten plus minor
     pub fn arch(&self) -> u32 {
         self.arch
+    }
+
+    /// Streaming multiprocessors of the device
+    pub fn sm_count(&self) -> usize {
+        self.sms
+    }
+
+    /// PTX of a source for this device, through the disk cache
+    pub fn ptx(&self, name: &str, src: &str) -> Result<Ptx> {
+        self.compile(name, src)
     }
 
     /// Compiles CUDA C to PTX for this device and loads it under a module name
@@ -83,8 +102,27 @@ impl KernelRegistry {
         self.ensure(module)?;
         let m = self.modules.get(module).with_context(|| format!("no kernel module {module}"))?;
         let f = m.load_function(name).with_context(|| format!("no kernel {name} in {module}"))?;
+        self.names.insert(f.cu_function() as usize, format!("{module}.{name}"));
         self.functions.insert((module.to_string(), name.to_string()), f.clone());
         Ok(f)
+    }
+
+    /// A function whose dynamic shared memory limit allows smem bytes, raised past the 48 KB default once per function
+    pub fn function_smem(&mut self, module: &str, name: &str, smem: u32) -> Result<CudaFunction> {
+        let f = self.function(module, name)?;
+        if smem > 48 * 1024 {
+            let key = (module.to_string(), name.to_string());
+            if self.raised.get(&key).is_none_or(|have| *have < smem) {
+                f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).with_context(|| format!("{module}.{name} shared memory limit of {smem}"))?;
+                self.raised.insert(key, smem);
+            }
+        }
+        Ok(f)
+    }
+
+    /// Module and entry name of a loaded function
+    pub fn kernel_name(&self, f: &CudaFunction) -> &str {
+        self.names.get(&(f.cu_function() as usize)).map_or("?", String::as_str)
     }
 
     /// Kernel of a quant family entry for a ggml type
@@ -118,6 +156,9 @@ impl KernelRegistry {
         let mut h = Sha256::new();
         h.update(full.as_bytes());
         h.update(format!("\0sm_{}", self.arch).as_bytes());
+        if std::env::var_os("KF_LINEINFO").is_some() {
+            h.update(b"\0lineinfo");
+        }
         let mut key = String::with_capacity(64);
         for b in h.finalize() {
             write!(key, "{b:02x}")?;
@@ -128,8 +169,13 @@ impl KernelRegistry {
         {
             return Ok(Ptx::from_src(text));
         }
+        // KF_LINEINFO adds source line tables to the PTX for the CUDA sanitizers and profilers
+        let mut options = vec![format!("--gpu-architecture=compute_{}", self.arch), "-std=c++17".to_string()];
+        if std::env::var_os("KF_LINEINFO").is_some() {
+            options.push("-lineinfo".to_string());
+        }
         let opts = CompileOptions {
-            options: vec![format!("--gpu-architecture=compute_{}", self.arch), "-std=c++17".to_string()],
+            options,
             name: Some(format!("{name}.cu")),
             ..Default::default()
         };
@@ -186,24 +232,24 @@ pub fn cuda_kernel_for_op(registry: &KernelRegistry, op: &Op) -> Option<KernelRe
     let found = match op {
         Op::Input { .. } => fixed(&[("elementwise", "input_f32")]),
         Op::Embed { .. } => Some(KernelRef { fixed: &[], quant: &["embed"] }),
-        Op::MatMul { scale: None, .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("elementwise", "quant_act")], quant: &["matvec", "matmul", "dequant"] }),
-        Op::MatMul { scale: Some(_), .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("elementwise", "quant_act"), ("elementwise", "scale")], quant: &["matvec", "matmul", "dequant"] }),
-        Op::RmsNorm { .. } => Some(KernelRef { fixed: &[("norm", "rms_norm")], quant: &["dequant"] }),
+        Op::MatMul { scale: None, .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("fused", "quant_act")], quant: &["matvec", "matmul", "matvec_i8", "dequant"] }),
+        Op::MatMul { scale: Some(_), .. } => Some(KernelRef { fixed: &[("elementwise", "round_act"), ("fused", "quant_act"), ("elementwise", "scale")], quant: &["matvec", "matmul", "matvec_i8", "dequant"] }),
+        Op::RmsNorm { .. } => Some(KernelRef { fixed: &[("norm", "rms_norm"), ("norm", "rms_norm_add"), ("fused", "rms_norm_q8")], quant: &["dequant"] }),
         Op::LayerNorm { .. } => Some(KernelRef { fixed: &[("norm", "layer_norm")], quant: &["dequant"] }),
         Op::L2Norm { .. } => fixed(&[("norm", "l2_norm")]),
-        Op::Rope { params, offset: 0, inverse: false, .. } if matches!(params.kind, RopeKind::Normal | RopeKind::Neox) => fixed(&[("rope", "rope")]),
+        Op::Rope { .. } => fixed(&[("rope", "rope"), ("fused", "norm_rope_hd128")]),
         Op::AttentionFull { .. } => fixed(&[("attention", "attention_full")]),
         Op::GeluQuick => fixed(&[("elementwise", "unary")]),
         Op::PoolGrid { .. } => fixed(&[("elementwise", "pool_grid")]),
         Op::Attention { alibi_bias, kv_source: None, top_k: None, window, .. } if *alibi_bias == 0.0 && window.is_none_or(|w| w.kind == SwaType::Standard) => {
-            Some(KernelRef { fixed: &[("attention", "kv_append"), ("attention", "attention")], quant: &["dequant"] })
+            Some(KernelRef { fixed: &[("attention", "kv_append"), ("attention", "attention"), ("flash", "flash_prefill_hd128")], quant: &["dequant"] })
         }
         Op::MoeFfn { .. } if moe_on_device(op) => Some(KernelRef {
-            fixed: &[("moe", "moe_route"), ("moe", "moe_group"), ("moe", "moe_glu"), ("moe", "moe_combine"), ("elementwise", "round_act")],
-            quant: &["matvec", "matmul", "moe_matvec", "moe_matmul", "dequant"],
+            fixed: &[("moe", "moe_route"), ("moe", "moe_group"), ("moe", "moe_glu"), ("moe", "moe_combine"), ("elementwise", "round_act"), ("fused", "quant_act")],
+            quant: &["matvec", "matmul", "moe_matvec", "moe_matvec_i8", "moe_matmul", "dequant"],
         }),
-        Op::GatedAct { act, limit: None } if act_on_device(act) => fixed(&[("elementwise", "gated_act")]),
-        Op::GatedActFused { act, limit: None } if act_on_device(act) => fixed(&[("elementwise", "gated_act_fused")]),
+        Op::GatedAct { act, limit: None } if act_on_device(act) => fixed(&[("elementwise", "gated_act"), ("fused", "gated_act_q8")]),
+        Op::GatedActFused { act, limit: None } if act_on_device(act) => fixed(&[("elementwise", "gated_act_fused"), ("fused", "gated_act_q8")]),
         Op::Add | Op::Sub | Op::Mul | Op::Div => fixed(&[("elementwise", "binary")]),
         Op::MulWeight { .. } | Op::AddWeight { .. } | Op::DivWeight { .. } => Some(KernelRef { fixed: &[("elementwise", "row_op")], quant: &["dequant"] }),
         Op::Scale(_) => fixed(&[("elementwise", "scale")]),
@@ -225,6 +271,7 @@ pub fn cuda_kernel_for_op(registry: &KernelRegistry, op: &Op) -> Option<KernelRe
         | Op::Clamp { .. }
         | Op::ScaleBias { .. } => fixed(&[("elementwise", "unary")]),
         Op::Softmax => fixed(&[("norm", "softmax")]),
+        Op::TopK { .. } => fixed(&[("sample", "topk")]),
         Op::SumRows => fixed(&[("norm", "sum_rows")]),
         Op::Softcap(_) => fixed(&[("elementwise", "softcap")]),
         Op::Reshape { .. } | Op::LastRows { .. } | Op::Rows { .. } => fixed(&[]),

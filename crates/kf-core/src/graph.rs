@@ -295,6 +295,8 @@ pub enum Op {
     SumRows,
     Round,
     MaskCols { start: usize, len: usize, value: f32 },
+    /// The k largest values of every row with their ids, largest first and lower id first among equals, then the row's log sum exp, as 2k plus 1 floats
+    TopK { k: usize },
     /// Input tokens, maps each id through the table to a scalar, unlisted ids give the default or themselves
     MapTokens { table: Arc<Vec<(u32, f32)>>, default: Option<f32> },
     /// Depthwise causal conv over channels with a carried state row per layer and slot
@@ -341,6 +343,8 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub inputs: Vec<(&'static str, Tid)>,
     pub output: Option<Tid>,
+    /// The residual rows before the final norm, one per row of logits, kept through the pass for a draft head to read
+    pub hidden: Option<Tid>,
     next: u32,
 }
 
@@ -420,5 +424,10 @@ impl GraphBuilder {
     pub fn finish(mut self, output: Tid) -> Graph {
         self.graph.output = Some(output);
         self.graph
+    }
+
+    /// Marks the residual rows before the final norm as the hidden rows the pass keeps
+    pub fn keep_hidden(&mut self, t: Tid) {
+        self.graph.hidden = Some(t);
     }
 }

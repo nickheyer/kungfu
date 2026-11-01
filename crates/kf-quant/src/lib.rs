@@ -1,5 +1,8 @@
 pub mod types;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod simd;
+
 /// Block layout of one ggml tensor type
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TypeInfo {
@@ -27,6 +30,112 @@ pub trait Quant: Send + Sync {
         self.dequant_row(src, &mut tmp);
         tmp.iter().zip(x).map(|(a, b)| a * b).sum()
     }
+    /// Dot products of one quantized row against every row of int8 activations of its kind, y[r] receiving row r
+    fn dot_i8(&self, src: &[u8], x: &ActI8, y: &mut [f32]) {
+        dot_i8_generic(self, src, x, y)
+    }
+}
+
+/// The reference dot of one row against every activation row, the integers scaled back to the floats the reference multiplies
+pub fn dot_i8_generic<Q: Quant + ?Sized>(q: &Q, src: &[u8], x: &ActI8, y: &mut [f32]) {
+    for r in 0..x.rows {
+        y[r] = q.dot_row(src, &x.dequant_row(r));
+    }
+}
+
+/// Activations in the integer form the reference rounds them to, int8 values with a scale and the integer sum per sixteen
+pub struct ActI8 {
+    pub rows: usize,
+    pub n: usize,
+    pub q: Vec<i8>,
+    pub d: Vec<f32>,
+    pub sum: Vec<i32>,
+}
+
+impl ActI8 {
+    pub fn row_q(&self, r: usize) -> &[i8] {
+        &self.q[r * self.n..(r + 1) * self.n]
+    }
+
+    /// Scale of every sixteen of row r
+    pub fn row_d(&self, r: usize) -> &[f32] {
+        let n16 = self.n / 16;
+        &self.d[r * n16..(r + 1) * n16]
+    }
+
+    /// Integer sum of every sixteen of row r
+    pub fn row_sum(&self, r: usize) -> &[i32] {
+        let n16 = self.n / 16;
+        &self.sum[r * n16..(r + 1) * n16]
+    }
+
+    /// Row r as the floats the reference multiplies, scale times integer
+    pub fn dequant_row(&self, r: usize) -> Vec<f32> {
+        let d = self.row_d(r);
+        self.row_q(r).iter().enumerate().map(|(j, q)| d[j / 16] * *q as f32).collect()
+    }
+}
+
+/// Rows of activations quantized the way round_activations rounds them, the same integers it would multiply back
+pub fn quantize_activations(kind: ActKind, x: &[f32], rows: usize) -> Option<ActI8> {
+    let n = if rows == 0 { 0 } else { x.len() / rows };
+    if !n.is_multiple_of(16) {
+        return None;
+    }
+    let n16 = n / 16;
+    let mut out = ActI8 { rows, n, q: vec![0; rows * n], d: vec![0.0; rows * n16], sum: vec![0; rows * n16] };
+    let block = match kind {
+        ActKind::Q8_0 | ActKind::Q8_1 => 32,
+        ActKind::Q8K => 256,
+        ActKind::F32 | ActKind::F16 | ActKind::Bf16 => return None,
+    };
+    if !n.is_multiple_of(block) {
+        return None;
+    }
+    for r in 0..rows {
+        let xr = &x[r * n..(r + 1) * n];
+        let qr = &mut out.q[r * n..(r + 1) * n];
+        for (bi, blk) in xr.chunks_exact(block).enumerate() {
+            let qb = &mut qr[bi * block..(bi + 1) * block];
+            let d = match kind {
+                ActKind::Q8_0 | ActKind::Q8_1 => {
+                    let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    let d = amax / 127.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    for (q, v) in qb.iter_mut().zip(blk) {
+                        *q = (v * id).round() as i8;
+                    }
+                    half::f16::from_f32(d).to_f32()
+                }
+                _ => {
+                    let mut amax = 0.0f32;
+                    let mut max = 0.0f32;
+                    for v in blk {
+                        if v.abs() > amax {
+                            amax = v.abs();
+                            max = *v;
+                        }
+                    }
+                    if amax == 0.0 {
+                        qb.fill(0);
+                        0.0
+                    } else {
+                        let iscale = -127.0 / max;
+                        for (q, v) in qb.iter_mut().zip(blk) {
+                            *q = nearest_int(iscale * v).min(127) as i8;
+                        }
+                        1.0 / iscale
+                    }
+                }
+            };
+            for g in 0..block / 16 {
+                let at = r * n16 + bi * (block / 16) + g;
+                out.d[at] = d;
+                out.sum[at] = qb[g * 16..g * 16 + 16].iter().map(|v| *v as i32).sum();
+            }
+        }
+    }
+    Some(out)
 }
 
 /// How the reference rounds activations before a dot product against this weight type

@@ -278,7 +278,7 @@ const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p
 const GPT4O: &str = r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const TINY_AYA_WORDS: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const NEWLINES: &str = r"[^\n]+|[\n]+";
-const DEEPSEEK_LLM_LETTERS: &str = "\\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-ώᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+";
+const DEEPSEEK_LLM_LETTERS: &str = "\\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-\u{1F7D}ᾀ-ᾴᾶ-ᾼ\u{1FBE}ῂ-ῄῆ-ῌῐ-\u{1FD3}ῖ-\u{1FDB}ῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤ\u{2126}ℨ\u{212A}-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+";
 
 /// The split patterns the reference applies in order for every pre tokenizer name it knows
 pub fn pretokenizer_regexes_for(pre: &str) -> Result<PreTok> {
@@ -531,6 +531,47 @@ impl Spm {
         match std::str::from_utf8(&bytes) {
             Ok(s) => s.to_string(),
             Err(e) => String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEEPSEEK_LLM_LETTERS, onig_syntax, pretokenizer_regexes_for};
+    use tokenizers::SplitDelimiterBehavior;
+    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+
+    const PRE_NAMES: &[&str] = &[
+        "", "default", "flint", "minicpm5", "llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "midm-2.0",
+        "jina-v5-nano", "lfm2", "dbrx", "smaug-bpe", "chatglm-bpe", "glm4", "glm5", "jais-2", "deepseek-llm",
+        "deepseek-v3", "hunyuan-dense", "joyai-llm", "hy_v4", "spark2_5", "youtu", "deepseek-coder", "falcon",
+        "starcoder", "refact", "command-r", "smollm", "codeshell", "exaone", "minerva-7b", "mellum2", "gpt-2",
+        "phi-2", "jina-es", "jina-de", "gigachat", "jina-v2-es", "jina-v2-de", "a.x-4.0", "mellum", "modern-bert",
+        "jina-v1-en", "jina-v2-code", "roberta-bpe", "mpt", "olmo", "jais", "trillion", "granite-docling", "exaone4",
+        "qwen2", "deepseek-r1-qwen", "kormo", "f2llmv2", "stablelm2", "hunyuan", "solar-open", "megrez", "qwen35",
+        "poro-chat", "bloom", "gpt3-finnish", "viking", "tekken", "pixtral", "nemotron-3.5-embed", "chameleon",
+        "gpt-4o", "llama4", "kanana2", "talkie", "minimax-m2", "granite-embed-multi-97m", "tiny_aya", "cohere2moe",
+        "kimi-k2", "superbpe", "bailingmoe", "bailingmoe2", "llada-moe", "seed-coder", "ufakzeka", "grok-2", "afmoe",
+        "laguna", "exaone-moe", "k2-horizon", "gemma4", "granite-embed-multi-311m", "sarvam-moe", "domyn-small",
+        "mmbert", "soprano", "whitespace",
+    ];
+
+    /// Every known pre tokenizer's split patterns compile in the engine that runs them
+    #[test]
+    fn every_pretokenizer_regex_compiles() {
+        for name in PRE_NAMES {
+            let pt = pretokenizer_regexes_for(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for pattern in pt.regexes {
+                Split::new(SplitPattern::Regex(onig_syntax(pattern)), SplitDelimiterBehavior::Isolated, false).unwrap_or_else(|e| panic!("{name}: {pattern}: {e}"));
+            }
+        }
+    }
+
+    /// The deepseek-llm letter class keeps the reference's code points that canonical normalization would fold away
+    #[test]
+    fn deepseek_letters_keep_reference_code_points() {
+        for c in ['\u{1F7D}', '\u{1FBE}', '\u{1FD3}', '\u{1FDB}', '\u{2126}', '\u{212A}'] {
+            assert!(DEEPSEEK_LLM_LETTERS.contains(c), "{c:?} missing");
         }
     }
 }

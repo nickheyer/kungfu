@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use kf_backend_cpu::CpuBackend;
-use kf_core::{Backend, Graph, GraphBuilder, Inputs, LayerPlan, Op, Plan, Pool, SwaType, Wid, Window};
+use kf_core::{Backend, Graph, GraphBuilder, Inputs, LayerPlan, Op, Plan, Pool, RopeKind, RopeParams, SwaType, Wid, Window};
 
 const N_EMBD: usize = 64;
 const N_HEAD: usize = 4;
@@ -187,4 +187,215 @@ fn undivided_and_windowed_attention_match_reference() {
             both(&format!("{what} decode {s}"), &g, &run_inputs(&[(0, 3 * N_BATCH + s, 1), (1, N_BATCH + s, 1)]), &m.w, &mut cpu, &mut gpu, 2e-2);
         }
     }
+}
+
+/// Attention at the head sizes the tensor core kernel compiles for, over partial query tiles, two slots, a window with
+/// sinks, a softcap, and rows that attend ahead, then decode steps over the same cache
+#[test]
+fn tensor_core_attention_matches_reference() {
+    let mut gpu = cuda();
+    if gpu.kernels.arch() < 80 {
+        eprintln!("skipping, the tensor core attention needs sm_80");
+        return;
+    }
+    for (hd, n_head, n_head_kv) in [(64usize, 4usize, 2usize), (128, 4, 2), (80, 2, 1), (256, 2, 2)] {
+        let mut rng = Rng(0xF1A5 + hd as u64);
+        let mut w = Mem::default();
+        let n_embd = 64;
+        let table = w.f32("table", &[n_embd, 64], &rng.vec(64 * n_embd, 1.0));
+        let wq = w.f32("wq", &[n_embd, n_head * hd], &rng.vec(n_embd * n_head * hd, 0.25));
+        let wk = w.f32("wk", &[n_embd, n_head_kv * hd], &rng.vec(n_embd * n_head_kv * hd, 0.25));
+        let wv = w.f32("wv", &[n_embd, n_head_kv * hd], &rng.vec(n_embd * n_head_kv * hd, 0.25));
+        let sinks = w.f32("sinks", &[n_head], &rng.vec(n_head, 1.0));
+        for (what, window, with_sinks, softcap) in [("plain", None, false, 0.0f32), ("windowed with sinks", Some(Window { size: 200, kind: SwaType::Standard }), true, 0.0), ("softcap", None, false, 20.0)] {
+            let mut g = GraphBuilder::new();
+            let tokens = g.input("tokens");
+            let x = g.push(Op::Embed { weight: table }, &[tokens]);
+            g.layer = Some(0);
+            let q = g.push(Op::MatMul { weight: wq, bias: None, scale: None }, &[x]);
+            let k = g.push(Op::MatMul { weight: wk, bias: None, scale: None }, &[x]);
+            let v = g.push(Op::MatMul { weight: wv, bias: None, scale: None }, &[x]);
+            let a = g.push(Op::Attention { layer: 0, n_head, n_head_kv, head_dim: hd, head_dim_v: hd, scale: 1.0 / (hd as f32).sqrt(), window, softcap, sinks: with_sinks.then_some(sinks), alibi_bias: 0.0, kv_source: None, top_k: None }, &[q, k, v]);
+            let graph = g.finish(a);
+            let n_batch = 160;
+            let plan = |pool: Pool| Plan { layers: vec![LayerPlan { layer: 0, weights: pool, state: pool, expert_cache_slots: 0, kv_resident: 0 }], pinned: Vec::new(), weights_bytes: 0, state_bytes: 0, n_ctx: 1024, n_batch, n_seq: 2 };
+            let mut cpu = CpuBackend::new();
+            cpu.apply_plan(&plan(Pool::Host)).expect("cpu plan");
+            gpu.apply_plan(&plan(Pool::Device(0))).expect("cuda plan");
+            let label = format!("hd {hd} {what}");
+            both(&format!("{label} slot zero first chunk"), &graph, &run_inputs(&[(0, 0, 160)]), &w, &mut cpu, &mut gpu, 2e-2);
+            both(&format!("{label} slot zero second chunk"), &graph, &run_inputs(&[(0, 160, 100)]), &w, &mut cpu, &mut gpu, 2e-2);
+            both(&format!("{label} slot one"), &graph, &run_inputs(&[(1, 0, 70)]), &w, &mut cpu, &mut gpu, 2e-2);
+            both(&format!("{label} both slots in one pass"), &graph, &run_inputs(&[(1, 70, 40), (0, 260, 90)]), &w, &mut cpu, &mut gpu, 2e-2);
+            let mut ahead = run_inputs(&[(0, 350, 48)]);
+            ahead.attend = (350..398).map(|p| if (360..380).contains(&p) { 379 } else { p as u32 }).collect();
+            both(&format!("{label} rows attending ahead"), &graph, &ahead, &w, &mut cpu, &mut gpu, 2e-2);
+            both(&format!("{label} decode"), &graph, &run_inputs(&[(0, 398, 1), (1, 110, 1)]), &w, &mut cpu, &mut gpu, 2e-2);
+        }
+    }
+}
+
+/// A tree pass gives every row what feeding its path alone would, on both backends, and keeping one path leaves the
+/// slot as if that path alone had been fed
+#[test]
+fn tree_rows_match_their_paths_and_compaction_keeps_one() {
+    let m = model(0x7EE);
+    let g = graph(&m);
+    let mut cpu = CpuBackend::new();
+    cpu.apply_plan(&plan(Pool::Host, 0)).expect("cpu plan");
+    let mut gpu = cuda();
+    gpu.apply_plan(&plan(Pool::Device(0), 0)).expect("cuda plan");
+    // Both slots hold the same 48 tokens of history, fed within the batch
+    let history = run_inputs(&[(0, 0, 24), (0, 24, 24)]);
+    let mut history1 = history.clone();
+    history1.seqs = vec![1; 48];
+    for (c, chunk) in [(0usize, 0usize), (1, 24)] {
+        both(&format!("tree history slot zero chunk {c}"), &g, &history.slice(chunk..chunk + 24), &m.w, &mut cpu, &mut gpu, 2e-2);
+        both(&format!("tree history slot one chunk {c}"), &g, &history1.slice(chunk..chunk + 24), &m.w, &mut cpu, &mut gpu, 2e-2);
+    }
+    //      0
+    //    / | \
+    //   1  2  3
+    //  / \    |
+    // 4   5   6
+    //         |
+    //         7
+    let tokens: Vec<u32> = vec![5, 9, 14, 23, 31, 40, 47, 52];
+    let parents: Vec<i32> = vec![-1, 0, 0, 0, 1, 1, 3, 6];
+    let tree = both("tree pass", &g, &tree_inputs(0, 48, &tokens, &parents), &m.w, &mut cpu, &mut gpu, 2e-2);
+    let cols = N_HEAD * HD;
+    for leaf in [4usize, 5, 7] {
+        let mut path = vec![leaf];
+        while parents[*path.last().expect("path")] >= 0 {
+            path.push(parents[*path.last().expect("path")] as usize);
+        }
+        path.reverse();
+        let mut cpu1 = CpuBackend::new();
+        cpu1.apply_plan(&plan(Pool::Host, 0)).expect("cpu plan");
+        let mut gpu1 = cuda();
+        gpu1.apply_plan(&plan(Pool::Device(0), 0)).expect("cuda plan");
+        for chunk in [0usize, 24] {
+            both("path history", &g, &history.slice(chunk..chunk + 24), &m.w, &mut cpu1, &mut gpu1, 2e-2);
+        }
+        let linear = Inputs { tokens: path.iter().map(|i| tokens[*i]).collect(), positions: (48..48 + path.len() as u32).collect(), seqs: vec![0; path.len()], ..Default::default() };
+        let want = both(&format!("path to {leaf} fed alone"), &g, &linear, &m.w, &mut cpu1, &mut gpu1, 2e-2);
+        for (k, i) in path.iter().enumerate() {
+            assert_close(&format!("tree row {i} against its path"), &tree[i * cols..(i + 1) * cols], &want[k * cols..(k + 1) * cols], 2e-2);
+        }
+    }
+    // Keep the path to row 7, then both slots continue from the same 52 rows and must agree
+    let keep = [0usize, 3, 6, 7];
+    cpu.compact(0, 48, &keep).expect("cpu compact");
+    gpu.compact(0, 48, &keep).expect("cuda compact");
+    let path1 = Inputs { tokens: keep.iter().map(|i| tokens[*i]).collect(), positions: (48..52).collect(), seqs: vec![1; 4], ..Default::default() };
+    both("slot one fed the kept path", &g, &path1, &m.w, &mut cpu, &mut gpu, 2e-2);
+    let step = Inputs { tokens: vec![33, 33], positions: vec![52, 52], seqs: vec![0, 1], ..Default::default() };
+    let out = both("step after compaction", &g, &step, &m.w, &mut cpu, &mut gpu, 2e-2);
+    assert_close("compacted slot against the path fed alone", &out[..cols], &out[cols..], 2e-2);
+}
+
+/// A chain shaped tree pass equals the plain pass of the same rows on each backend by itself
+#[test]
+fn chain_tree_equals_plain_rows_per_backend() {
+    let m = model(0x7EE);
+    let g = graph(&m);
+    let history = run_inputs(&[(0, 0, 24)]);
+    let tokens: Vec<u32> = vec![5, 9, 14, 23];
+    let parents: Vec<i32> = vec![-1, 0, 1, 2];
+    let plain = Inputs { tokens: tokens.clone(), positions: (24..28).collect(), seqs: vec![0; 4], ..Default::default() };
+    let tree = tree_inputs(0, 24, &tokens, &parents);
+    let cols = N_HEAD * HD;
+    for backend in ["cpu", "cuda"] {
+        let mut outs = Vec::new();
+        for inputs in [&plain, &tree] {
+            let out = if backend == "cpu" {
+                let mut b = CpuBackend::new();
+                b.apply_plan(&plan(Pool::Host, 0)).expect("plan");
+                b.run(&g, &history, &m.w).expect("history");
+                b.run(&g, inputs, &m.w).expect("pass")
+            } else {
+                let mut b = cuda();
+                b.apply_plan(&plan(Pool::Device(0), 0)).expect("plan");
+                b.run(&g, &history, &m.w).expect("history");
+                b.run(&g, inputs, &m.w).expect("pass")
+            };
+            outs.push(out);
+        }
+        for r in 0..4 {
+            let e = rel_err(&outs[1][r * cols..(r + 1) * cols], &outs[0][r * cols..(r + 1) * cols]);
+            eprintln!("{backend} row {r}: chain tree against plain rows, relative error {e}");
+        }
+        assert_close(&format!("{backend} chain tree against plain rows"), &outs[1], &outs[0], 1e-3);
+    }
+}
+
+/// The tree tests again at a head size the decode kernel serves, with rope ahead of the attention as a model has
+#[test]
+fn tree_rows_match_their_paths_through_the_decode_kernel() {
+    const HD64: usize = 64;
+    let mut rng = Rng(0xD3C0DE);
+    let mut w = Mem::default();
+    let table = w.f32("table", &[N_EMBD, 64], &rng.vec(64 * N_EMBD, 1.0));
+    let wq = w.f32("wq", &[N_EMBD, N_HEAD * HD64], &rng.vec(N_EMBD * N_HEAD * HD64, 0.125));
+    let wk = w.f32("wk", &[N_EMBD, N_HEAD_KV * HD64], &rng.vec(N_EMBD * N_HEAD_KV * HD64, 0.125));
+    let wv = w.f32("wv", &[N_EMBD, N_HEAD_KV * HD64], &rng.vec(N_EMBD * N_HEAD_KV * HD64, 0.125));
+    let rope = RopeParams { kind: RopeKind::Neox, dims: HD64, base: 10000.0, scale: 1.0, orig_ctx: 4096, attn_factor: 1.0, yarn: None, sections: [0; 4], factors: None };
+    let mut g = GraphBuilder::new();
+    let tokens = g.input("tokens");
+    let positions = g.input("positions");
+    let x = g.push(Op::Embed { weight: table }, &[tokens]);
+    g.layer = Some(0);
+    let q = g.push(Op::MatMul { weight: wq, bias: None, scale: None }, &[x]);
+    let k = g.push(Op::MatMul { weight: wk, bias: None, scale: None }, &[x]);
+    let v = g.push(Op::MatMul { weight: wv, bias: None, scale: None }, &[x]);
+    let q = g.push(Op::Rope { params: rope.clone(), n_head: N_HEAD, head_dim: HD64, offset: 0, inverse: false }, &[q, positions]);
+    let k = g.push(Op::Rope { params: rope, n_head: N_HEAD_KV, head_dim: HD64, offset: 0, inverse: false }, &[k, positions]);
+    let a = g.push(Op::Attention { layer: 0, n_head: N_HEAD, n_head_kv: N_HEAD_KV, head_dim: HD64, head_dim_v: HD64, scale: 0.125, window: None, softcap: 0.0, sinks: None, alibi_bias: 0.0, kv_source: None, top_k: None }, &[q, k, v]);
+    let g = g.finish(a);
+    let cols = N_HEAD * HD64;
+    let history = run_inputs(&[(0, 0, 24), (0, 24, 24)]);
+    let tokens_t: Vec<u32> = vec![5, 9, 14, 23, 31, 40, 47, 52];
+    let parents: Vec<i32> = vec![-1, 0, 0, 0, 1, 1, 3, 6];
+    let fresh = |cpu: &mut CpuBackend, gpu: &mut kf_backend_cuda::CudaBackend| {
+        for chunk in [0usize, 24] {
+            both("decode tree history", &g, &history.slice(chunk..chunk + 24), &w, cpu, gpu, 2e-2);
+        }
+    };
+    let mut cpu = CpuBackend::new();
+    cpu.apply_plan(&plan(Pool::Host, 0)).expect("cpu plan");
+    let mut gpu = cuda();
+    gpu.apply_plan(&plan(Pool::Device(0), 0)).expect("cuda plan");
+    fresh(&mut cpu, &mut gpu);
+    let tree = both("decode tree pass", &g, &tree_inputs(0, 48, &tokens_t, &parents), &w, &mut cpu, &mut gpu, 2e-2);
+    for leaf in [4usize, 5, 7] {
+        let mut path = vec![leaf];
+        while parents[*path.last().expect("path")] >= 0 {
+            path.push(parents[*path.last().expect("path")] as usize);
+        }
+        path.reverse();
+        let mut cpu1 = CpuBackend::new();
+        cpu1.apply_plan(&plan(Pool::Host, 0)).expect("cpu plan");
+        let mut gpu1 = cuda();
+        gpu1.apply_plan(&plan(Pool::Device(0), 0)).expect("cuda plan");
+        fresh(&mut cpu1, &mut gpu1);
+        let linear = Inputs { tokens: path.iter().map(|i| tokens_t[*i]).collect(), positions: (48..48 + path.len() as u32).collect(), seqs: vec![0; path.len()], ..Default::default() };
+        let want = both(&format!("decode path to {leaf} fed alone"), &g, &linear, &w, &mut cpu1, &mut gpu1, 2e-2);
+        for (k, i) in path.iter().enumerate() {
+            assert_close(&format!("decode tree row {i} against its path"), &tree[i * cols..(i + 1) * cols], &want[k * cols..(k + 1) * cols], 2e-2);
+        }
+    }
+    let keep = [0usize, 3, 6, 7];
+    cpu.compact(0, 48, &keep).expect("cpu compact");
+    gpu.compact(0, 48, &keep).expect("cuda compact");
+    let mut cpu1 = CpuBackend::new();
+    cpu1.apply_plan(&plan(Pool::Host, 0)).expect("cpu plan");
+    let mut gpu1 = cuda();
+    gpu1.apply_plan(&plan(Pool::Device(0), 0)).expect("cuda plan");
+    fresh(&mut cpu1, &mut gpu1);
+    let path1 = Inputs { tokens: keep.iter().map(|i| tokens_t[*i]).collect(), positions: (48..52).collect(), seqs: vec![0; 4], ..Default::default() };
+    both("decode kept path fed alone", &g, &path1, &w, &mut cpu1, &mut gpu1, 2e-2);
+    let step = Inputs { tokens: vec![33], positions: vec![52], seqs: vec![0], ..Default::default() };
+    let after = both("decode step after compaction", &g, &step, &w, &mut cpu, &mut gpu, 2e-2);
+    let alone = both("decode step after the path alone", &g, &step, &w, &mut cpu1, &mut gpu1, 2e-2);
+    assert_close("decode compacted slot against the path fed alone", &after, &alone, 2e-2);
 }

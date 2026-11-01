@@ -1,6 +1,7 @@
 use crate::chat::{self, ChatSpec, ResponseFormat, ToolChoice};
 use crate::describe::{STOP_GRACE_SECONDS, describe};
 use crate::engine::{Cmd, DraftConn, Engine, Outcome, Piece, SlotAction, TokenLogprob};
+use crate::head::{DRAFT_VOCAB, Head, Source, TRAIN_BATCH};
 use crate::params::{Ctx, Launch};
 use crate::parse::{Delta, Format, StreamParser, parse_output};
 use crate::template::{ChatTemplate, Message};
@@ -13,11 +14,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::Stream;
-use kf_core::{AllocKind, Pool, event};
+use kf_core::{AllocKind, FEATURE_RING_ROWS, HeadConfig, Pool, event};
 use kf_engine::{BackendChoice, CtxChoice, Sampling, Scope, Session, StageConn, StageRunner};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -56,7 +57,17 @@ pub struct Metrics {
     pub cached_tokens: AtomicU64,
     pub completion_tokens: AtomicU64,
     pub cancelled: AtomicU64,
-    pub cache_stats: Mutex<Vec<(usize, usize, u64, u64, u64, u64)>>,
+    pub cache_stats: Mutex<Vec<(usize, usize, u64, u64)>>,
+    /// The learned head's training steps, running loss, and running hit rate, the floats as their bits
+    pub head_steps: AtomicU64,
+    pub head_loss: AtomicU32,
+    pub head_hit: AtomicU32,
+    /// Tokens a second a round yields with the head's tree and with the ngram's, as the scheduler measures them
+    pub rate_head: AtomicU32,
+    pub rate_ngram: AtomicU32,
+    /// Drafted rounds and the tokens they had accepted, by Source::DRAFTERS
+    pub draft_rounds: [AtomicU64; 3],
+    pub draft_accepted: [AtomicU64; 3],
 }
 
 const LOADING: u8 = 0;
@@ -181,11 +192,19 @@ pub async fn serve(launch: Launch) -> Result<()> {
     {
         event::error("backend", &[("detail", format!("{e:#}"))]);
     }
-    if let (Some(dir), Some(s)) = (cache_dir, served.read().ok().and_then(|g| g.clone())) {
+    if let Some(s) = served.read().ok().and_then(|g| g.clone()) {
         let s: Arc<Served> = s;
         let engine = s.engine.clone();
-        let profile = tokio::task::spawn_blocking(move || engine.profile()).await.ok().flatten();
-        if let Some(p) = profile {
+        let (profile, engine) = tokio::task::spawn_blocking(move || {
+            let p = engine.profile();
+            // The scheduler thread ends here, releasing the backend before the process exits
+            engine.stop();
+            (p, engine)
+        })
+        .await
+        .map_err(|e| anyhow!("engine shutdown: {e}"))?;
+        drop(engine);
+        if let (Some(dir), Some(p)) = (cache_dir, profile) {
             std::fs::create_dir_all(&dir)?;
             p.write(&dir.join("routing_profile.json"))?;
         }
@@ -241,11 +260,10 @@ async fn serve_inner(launch: Launch, served: Arc<RwLock<Option<Arc<Served>>>>) -
             tick.tick().await;
             let Some(s) = cache_app.served.read().ok().and_then(|g| g.clone()) else { continue };
             let stats = s.engine.cache_stats().await;
-            for (layer, slots, hits, misses, pre, pre_hits) in &stats {
+            for (layer, slots, hits, misses) in &stats {
                 let total = hits + misses;
                 let rate = if total == 0 { 0.0 } else { *hits as f64 / total as f64 };
-                let pre_rate = if *pre == 0 { 0.0 } else { *pre_hits as f64 / *pre as f64 };
-                event::emit("cache", &[("layer", layer.to_string()), ("slots", slots.to_string()), ("hit_rate", format!("{rate:.4}")), ("prefetched", pre.to_string()), ("prefetch_hit_rate", format!("{pre_rate:.4}"))]);
+                event::emit("cache", &[("layer", layer.to_string()), ("slots", slots.to_string()), ("hit_rate", format!("{rate:.4}"))]);
             }
             if let Ok(mut g) = s.metrics.cache_stats.lock() {
                 *g = stats;
@@ -302,13 +320,13 @@ fn choose_backend(launch: &Launch) -> Result<BackendChoice> {
     })
 }
 
-/// Plans and opens the backend for a scope, each failure under its error code
-fn prepare_backend(launch: &Launch, loaded: &kf_engine::Loaded, choice: BackendChoice, scope: &Scope) -> Result<kf_engine::Prepared> {
+/// Plans and opens the backend for a scope with reserve bytes kept free beside the plan, each failure under its error code
+fn prepare_backend(launch: &Launch, loaded: &kf_engine::Loaded, choice: BackendChoice, scope: &Scope, reserve: u64) -> Result<kf_engine::Prepared> {
     let ctx = match launch.ctx {
         Ctx::Auto => CtxChoice::Auto,
         Ctx::Tokens(n) => CtxChoice::Tokens(n),
     };
-    kf_engine::prepare(loaded, choice, ctx, launch.n_batch, launch.n_parallel, launch.plan.as_deref(), launch.cache_dir.as_deref(), launch.profile.as_deref(), scope).map_err(|e| {
+    kf_engine::prepare(loaded, choice, ctx, launch.n_batch, launch.n_parallel, launch.plan.as_deref(), launch.cache_dir.as_deref(), launch.profile.as_deref(), scope, reserve).map_err(|e| {
         let detail = format!("{e:#}");
         match (launch.plan.as_ref(), detail.contains("free:")) {
             (_, true) => fail("device_oom", &[("detail", detail)]),
@@ -358,7 +376,7 @@ async fn serve_stage_role(launch: Launch) -> Result<()> {
     }
     let choice = choose_backend(&launch)?;
     let scope = Scope::range(from, to);
-    let prepared = prepare_backend(&launch, &loaded, choice, &scope)?;
+    let prepared = prepare_backend(&launch, &loaded, choice, &scope, 0)?;
     let n_ctx = prepared.plan.n_ctx;
     let mut runner = StageRunner::new(&loaded, prepared.backend, &prepared.plan, from, to).map_err(|e| fail("compose", &[("arch", loaded.hparams.arch.clone()), ("detail", format!("{e:#}"))]))?;
     let width = loaded.hparams.n_embd * loaded.model.streams;
@@ -474,7 +492,25 @@ fn load_and_warm(launch: Launch, app: Arc<App>) -> Result<()> {
     }
     let ranges: Vec<(usize, usize)> = stages.iter().map(|s| (s.from, s.to)).collect();
     let scope = Scope::outside(loaded.model.n_layers(), &ranges);
-    let prepared = prepare_backend(&launch, &loaded, choice, &scope)?;
+    let speculate = match launch.seat.speculate.as_str() {
+        "auto" => {
+            if matches!(choice, BackendChoice::Cuda { .. }) {
+                "head"
+            } else {
+                "ngram"
+            }
+        }
+        s => s,
+    };
+    if speculate == "head" && choice == BackendChoice::Cpu {
+        return Err(fail("bad_flag", &[("detail", "the learned head trains on a device, --speculate ngram or off runs on the cpu backend".to_string())]));
+    }
+    let head_on = speculate == "head" && !is_draft;
+    let (n_embd, n_vocab) = (loaded.hparams.n_embd, loaded.hparams.n_vocab);
+    let head_cfg = HeadConfig::for_width(n_embd);
+    let draft_vocab = DRAFT_VOCAB.min(n_vocab);
+    let reserve = if head_on { head_cfg.device_bytes(TRAIN_BATCH, launch.n_parallel, FEATURE_RING_ROWS, draft_vocab) } else { 0 };
+    let prepared = prepare_backend(&launch, &loaded, choice, &scope, reserve)?;
     let main = match choice {
         BackendChoice::Cpu => Pool::Host,
         BackendChoice::Cuda { device } => Pool::Device(device as u32),
@@ -499,9 +535,25 @@ fn load_and_warm(launch: Launch, app: Arc<App>) -> Result<()> {
     }
     app.phase.warmed.store(true, Ordering::Relaxed);
     session.reset_all().map_err(|e| fail("backend", &[("detail", format!("{e:#}"))]))?;
+    let head = if head_on {
+        let backend = session.backend_mut();
+        backend.drafter_start(head_cfg, loaded.model.embed.w, loaded.model.head.w, n_vocab, draft_vocab, TRAIN_BATCH, loaded.store.as_ref()).map_err(|e| fail("drafter", &[("detail", format!("{e:#}"))]))?;
+        let mut h = Head::new(launch.seat.head_rows, launch.cache_dir.clone(), model_name.clone(), n_embd, n_vocab);
+        let warm = match h.load(backend) {
+            Ok(warm) => warm,
+            Err(e) => {
+                event::emit("drafter", &[("saved", "unused".to_string()), ("detail", format!("{e:#}"))]);
+                false
+            }
+        };
+        event::emit("drafter", &[("params", head_cfg.n_params().to_string()), ("rows", launch.seat.head_rows.to_string()), ("warm", warm.to_string()), ("steps", h.steps.to_string()), ("hit", format!("{:.3}", h.hit))]);
+        Some(h)
+    } else {
+        None
+    };
     let measured = event::totals();
     let measured_json = serde_json::to_string(&measured)?;
-    event::emit("ready", &[("n_ctx", n_ctx.to_string()), ("warm_ms", t0.elapsed().as_millis().to_string()), ("measured", measured_json), ("role", launch.seat.role.clone()), ("rank", launch.seat.rank.to_string()), ("count", launch.seat.count.to_string()), ("stages", stage_peers.len().to_string()), ("draft", draft_peers.len().to_string())]);
+    event::emit("ready", &[("n_ctx", n_ctx.to_string()), ("warm_ms", t0.elapsed().as_millis().to_string()), ("measured", measured_json), ("role", launch.seat.role.clone()), ("rank", launch.seat.rank.to_string()), ("count", launch.seat.count.to_string()), ("stages", stage_peers.len().to_string()), ("draft", draft_peers.len().to_string()), ("head", head_on.to_string())]);
     let vision = match &launch.mmproj {
         Some(path) => {
             let clip = kf_vision::Clip::load(path).map_err(|e| fail("model_open", &[("path", path.display().to_string()), ("detail", format!("{e:#}"))]))?;
@@ -514,7 +566,8 @@ fn load_and_warm(launch: Launch, app: Arc<App>) -> Result<()> {
     };
     let metrics = Arc::new(Metrics::default());
     let n_seq = session.n_seq();
-    let engine = Engine::start(session, tok.clone(), draft, vision.clone(), metrics.clone());
+    let spec = matches!(speculate, "head" | "ngram").then(|| (kf_engine::Ngram::new(tok.vocab_size()), launch.seat.draft_max.max(1)));
+    let engine = Engine::start(session, tok.clone(), draft, spec, head, vision.clone(), metrics.clone());
     let served = Arc::new(Served {
         tok,
         template,
@@ -580,10 +633,19 @@ async fn metrics(State(app): State<Arc<App>>) -> Response {
         }
         out.push_str(&format!("# TYPE kungfu_context_tokens gauge\nkungfu_context_tokens {}\n", s.n_ctx));
         out.push_str(&format!("# TYPE kungfu_sequence_slots gauge\nkungfu_sequence_slots {}\n", s.n_seq));
+        out.push_str(&format!("# TYPE kungfu_head_steps_total counter\nkungfu_head_steps_total {}\n", m.head_steps.load(Ordering::Relaxed)));
+        for (name, bits) in [("kungfu_head_loss", &m.head_loss), ("kungfu_head_hit", &m.head_hit), ("kungfu_draft_rate_head", &m.rate_head), ("kungfu_draft_rate_ngram", &m.rate_ngram)] {
+            out.push_str(&format!("# TYPE {name} gauge\n{name} {}\n", f32::from_bits(bits.load(Ordering::Relaxed))));
+        }
+        out.push_str("# TYPE kungfu_draft_rounds_total counter\n# TYPE kungfu_draft_accepted_total counter\n");
+        for (k, source) in Source::DRAFTERS.iter().enumerate() {
+            let name = source.name();
+            out.push_str(&format!("kungfu_draft_rounds_total{{source=\"{name}\"}} {}\nkungfu_draft_accepted_total{{source=\"{name}\"}} {}\n", m.draft_rounds[k].load(Ordering::Relaxed), m.draft_accepted[k].load(Ordering::Relaxed)));
+        }
         if let Ok(stats) = m.cache_stats.lock() {
-            out.push_str("# TYPE kungfu_expert_cache_hits_total counter\n# TYPE kungfu_expert_cache_misses_total counter\n# TYPE kungfu_expert_cache_slots gauge\n# TYPE kungfu_expert_prefetch_total counter\n# TYPE kungfu_expert_prefetch_hits_total counter\n");
-            for (layer, slots, hits, misses, pre, pre_hits) in stats.iter() {
-                out.push_str(&format!("kungfu_expert_cache_slots{{layer=\"{layer}\"}} {slots}\nkungfu_expert_cache_hits_total{{layer=\"{layer}\"}} {hits}\nkungfu_expert_cache_misses_total{{layer=\"{layer}\"}} {misses}\nkungfu_expert_prefetch_total{{layer=\"{layer}\"}} {pre}\nkungfu_expert_prefetch_hits_total{{layer=\"{layer}\"}} {pre_hits}\n"));
+            out.push_str("# TYPE kungfu_expert_cache_hits_total counter\n# TYPE kungfu_expert_cache_misses_total counter\n# TYPE kungfu_expert_cache_slots gauge\n");
+            for (layer, slots, hits, misses) in stats.iter() {
+                out.push_str(&format!("kungfu_expert_cache_slots{{layer=\"{layer}\"}} {slots}\nkungfu_expert_cache_hits_total{{layer=\"{layer}\"}} {hits}\nkungfu_expert_cache_misses_total{{layer=\"{layer}\"}} {misses}\n"));
             }
         }
     }

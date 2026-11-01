@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use kf_backend_cpu::CpuBackend;
-use kf_core::{GraphBuilder, Op, Wid};
+use kf_core::{Backend, GraphBuilder, Op, Wid};
 
 #[test]
 fn every_kf_quant_type_has_kernels() {
@@ -54,7 +54,7 @@ fn matvec_and_matmul_match_reference_for_every_type() {
     let bias = w.f32("bias", &[n_out], &rng.vec(n_out, 0.5));
     let ids: Vec<(String, Wid)> = kf_quant::types::all().iter().map(|q| (q.info().name.to_string(), w.add(q.info().name, q.info().id, &[n_in, n_out], synth(&mut rng, q.info().id, n_out, n_in)))).collect();
     for (name, id) in ids {
-        for (rows, with_bias) in [(1, false), (1, true), (2, false), (5, true), (8, false), (9, true), (13, true), (40, false)] {
+        for (rows, with_bias) in [(1, false), (1, true), (2, false), (5, true), (8, false), (9, true), (13, true), (16, false), (23, true), (32, false), (33, true), (40, false)] {
             check_matmul(&format!("matmul {name}"), &w, table, id, with_bias.then_some(bias), rows, &mut cpu, &mut gpu, 1e-5);
         }
     }
@@ -76,7 +76,7 @@ fn int8_tensor_core_matmul_matches_reference_for_every_block_type() {
         let bias = w.f32("bias", &[n_out], &rng.vec(n_out, 0.5));
         let ids: Vec<(String, Wid)> = kf_backend_cuda::sources::INT8_TYPES
             .iter()
-            .map(|name| {
+            .map(|(name, _, _)| {
                 let q = kf_quant::by_name(name).expect("type");
                 assert!(n_in % q.info().block == 0, "{name} block {} does not divide {n_in}", q.info().block);
                 (name.to_string(), w.add(name, q.info().id, &[n_in, n_out], synth(&mut rng, q.info().id, n_out, n_in)))
@@ -144,5 +144,94 @@ fn real_tensors_match_reference() {
     for id in norms {
         let got = gpu.dequant(id, &w).expect("dequant");
         assert_close("f32 norm", &got, &kf_backend_cpu::dequant_all(id, &w).expect("reference"), 1e-5);
+    }
+}
+
+/// Several products of one input launch as one group, over both the tensor core tile and the matvec, for every
+/// block type, and each member's output matches the reference
+#[test]
+fn grouped_products_match_reference() {
+    let mut gpu = cuda();
+    if gpu.kernels.arch() < 80 {
+        eprintln!("skipping, the int8 path needs sm_80");
+        return;
+    }
+    let mut cpu = CpuBackend::new();
+    let mut rng = Rng(0x6c0_0b5e);
+    let n_in = 1024;
+    let mut w = Mem::default();
+    let table = embed_table(&mut w, &mut rng, n_in);
+    let bias = w.f32("bias", &[256], &rng.vec(256, 0.5));
+    let outs = [512usize, 256, 1024];
+    for (name, _, _) in kf_backend_cuda::sources::INT8_TYPES {
+        let q = kf_quant::by_name(name).expect("type");
+        let ids: Vec<Wid> = outs.iter().enumerate().map(|(i, &n_out)| w.add(&format!("{name}{i}"), q.info().id, &[n_in, n_out], synth(&mut rng, q.info().id, n_out, n_in))).collect();
+        for rows in [70usize, 3] {
+            let mut g = GraphBuilder::new();
+            let tokens = g.input("tokens");
+            let x = g.push(Op::Embed { weight: table }, &[tokens]);
+            let y0 = g.push(Op::MatMul { weight: ids[0], bias: None, scale: None }, &[x]);
+            let y1 = g.push(Op::MatMul { weight: ids[1], bias: Some(bias), scale: None }, &[x]);
+            let y2 = g.push(Op::MatMul { weight: ids[2], bias: None, scale: None }, &[x]);
+            let c = g.concat(y0, y1);
+            let all = g.concat(c, y2);
+            let graph = g.finish(all);
+            let toks: Vec<u32> = (0..rows as u32).map(|r| (r * 7 + 3) % 16).collect();
+            both(&format!("group {name} rows {rows}"), &graph, &inputs(&toks, 0), &w, &mut cpu, &mut gpu, 1e-5);
+        }
+    }
+}
+
+/// Error of each member of a grouped product for one offset type, for finding which segment goes wrong
+#[test]
+#[ignore]
+fn grouped_member_errors() {
+    let mut gpu = cuda();
+    let mut cpu = CpuBackend::new();
+    let mut rng = Rng(0x6c0_0b5e);
+    let n_in = 2048;
+    let q = kf_quant::by_name("q4_K").expect("type");
+    let mut w = Mem::default();
+    let table = embed_table(&mut w, &mut rng, n_in);
+    let outs = [512usize, 512, 2048];
+    let ids: Vec<Wid> = outs.iter().enumerate().map(|(i, &n_out)| w.add(&format!("w{i}"), q.info().id, &[n_in, n_out], synth(&mut rng, q.info().id, n_out, n_in))).collect();
+    for rows in [70usize, 3] {
+        let mut g = GraphBuilder::new();
+        let tokens = g.input("tokens");
+        let x = g.push(Op::Embed { weight: table }, &[tokens]);
+        let y0 = g.push(Op::MatMul { weight: ids[0], bias: None, scale: None }, &[x]);
+        let y1 = g.push(Op::MatMul { weight: ids[1], bias: None, scale: None }, &[x]);
+        let y2 = g.push(Op::MatMul { weight: ids[2], bias: None, scale: None }, &[x]);
+        let c = g.concat(y0, y1);
+        let all = g.concat(c, y2);
+        let graph = g.finish(all);
+        let toks: Vec<u32> = (0..rows as u32).map(|r| (r * 7 + 3) % 16).collect();
+        let inp = inputs(&toks, 0);
+        {
+            let mut g2 = GraphBuilder::new();
+            let tokens = g2.input("tokens");
+            let x = g2.push(Op::Embed { weight: table }, &[tokens]);
+            let _y0 = g2.push(Op::MatMul { weight: ids[0], bias: None, scale: None }, &[x]);
+            let _y1 = g2.push(Op::MatMul { weight: ids[1], bias: None, scale: None }, &[x]);
+            let y2 = g2.push(Op::MatMul { weight: ids[2], bias: None, scale: None }, &[x]);
+            let only = g2.finish(y2);
+            let want = cpu.run(&only, &inp, &w).expect("cpu");
+            let got = gpu.run(&only, &inp, &w).expect("cuda");
+            eprintln!("rows {rows} third member as the graph output: relative error {:.2e}", rel_err(&got, &want));
+        }
+        let want = cpu.run(&graph, &inp, &w).expect("cpu");
+        let got = gpu.run(&graph, &inp, &w).expect("cuda");
+        let total: usize = outs.iter().sum();
+        let mut start = 0;
+        for (i, &n) in outs.iter().enumerate() {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for r in 0..rows {
+                a.extend_from_slice(&got[r * total + start..r * total + start + n]);
+                b.extend_from_slice(&want[r * total + start..r * total + start + n]);
+            }
+            eprintln!("rows {rows} member {i} ({n} outputs): relative error {:.2e}", rel_err(&a, &b));
+            start += n;
+        }
     }
 }

@@ -28,4 +28,21 @@ struct Iq4Xs {
     }
 };
 
+// Word form: the sixteen nibble bytes of the sub block as one load, each word through the table
+template <>
+struct KfQ16<Iq4Xs> {
+    static __device__ __forceinline__ void load(const u8* __restrict__ b, int g, int4& wv, float& d, float& m) {
+        int ib = g >> 1, sh = (g & 1) * 4;
+        int scales_h = kf_u16(b + 2);
+        int ls = (((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4)) - 32;
+        d = kf_f16(b) * (float)ls;
+        m = 0.0f;
+        int4 r = kf_ld16(b + 8 + 16 * ib);
+        wv.x = (int)kf_iq4nl4(((u32)r.x >> sh) & 0x0F0F0F0Fu);
+        wv.y = (int)kf_iq4nl4(((u32)r.y >> sh) & 0x0F0F0F0Fu);
+        wv.z = (int)kf_iq4nl4(((u32)r.z >> sh) & 0x0F0F0F0Fu);
+        wv.w = (int)kf_iq4nl4(((u32)r.w >> sh) & 0x0F0F0F0Fu);
+    }
+};
+
 KF_QUANT_KERNELS_I8(Iq4Xs)

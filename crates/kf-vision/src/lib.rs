@@ -441,7 +441,7 @@ impl Clip {
             }
             _ => "output".to_string(),
         };
-        let inputs = Inputs { tokens: vec![0; n], positions: (0..n as u32).collect(), seqs: Vec::new(), hidden: img.patches.clone(), hidden_cols: img.patch_cols, rope: img.rope.clone(), attend: Vec::new() };
+        let inputs = Inputs { tokens: vec![0; n], positions: (0..n as u32).collect(), seqs: Vec::new(), hidden: img.patches.clone(), hidden_cols: img.patch_cols, rope: img.rope.clone(), attend: Vec::new(), tree: Vec::new() };
         Ok((backend.run(&g, &inputs, &self.store)?, name))
     }
 
@@ -452,7 +452,7 @@ impl Clip {
         if img.patches.len() != n * img.patch_cols {
             bail!("image carries {} values for {n} patches of {}", img.patches.len(), img.patch_cols);
         }
-        let inputs = Inputs { tokens: vec![0; n], positions: (0..n as u32).collect(), seqs: Vec::new(), hidden: img.patches.clone(), hidden_cols: img.patch_cols, rope: img.rope.clone(), attend: Vec::new() };
+        let inputs = Inputs { tokens: vec![0; n], positions: (0..n as u32).collect(), seqs: Vec::new(), hidden: img.patches.clone(), hidden_cols: img.patch_cols, rope: img.rope.clone(), attend: Vec::new(), tree: Vec::new() };
         let out = backend.run(&graph, &inputs, &self.store)?;
         let (nx, ny) = (img.n_merged_x(), img.n_merged_y());
         let n_tokens = nx * ny;

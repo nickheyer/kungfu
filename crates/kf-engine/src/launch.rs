@@ -42,9 +42,10 @@ impl RoutingProfile {
     }
 }
 
-/// Plans against the pool or a plan document, logs the plan event, opens the backend, applies the plan, and hands it the routing profile
+/// Plans against the pool or a plan document with reserve bytes of it kept free for what runs beside the plan, logs
+/// the plan event, opens the backend, applies the plan, and hands it the routing profile
 #[allow(clippy::too_many_arguments)]
-pub fn prepare(loaded: &Loaded, choice: BackendChoice, ctx: CtxChoice, n_batch: usize, n_seq: usize, plan_path: Option<&Path>, cache_dir: Option<&Path>, profile: Option<&Path>, scope: &Scope) -> Result<Prepared> {
+pub fn prepare(loaded: &Loaded, choice: BackendChoice, ctx: CtxChoice, n_batch: usize, n_seq: usize, plan_path: Option<&Path>, cache_dir: Option<&Path>, profile: Option<&Path>, scope: &Scope, reserve: u64) -> Result<Prepared> {
     if n_batch == 0 {
         bail!("a batch of zero tokens");
     }
@@ -53,6 +54,10 @@ pub fn prepare(loaded: &Loaded, choice: BackendChoice, ctx: CtxChoice, n_batch: 
     }
     let profile = profile.map(RoutingProfile::read).transpose()?;
     let (free, total) = pool_memory(choice)?;
+    if reserve >= free {
+        bail!("the pool has {free} bytes free and {reserve} are reserved beside the plan");
+    }
+    let free = free - reserve;
     let plan = match plan_path {
         Some(path) => {
             let text = std::fs::read_to_string(path).with_context(|| format!("read plan {}", path.display()))?;

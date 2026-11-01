@@ -26,26 +26,21 @@ kungfu serve --model model.gguf --role head --peer draft=0@10.0.0.3:9002 --draft
 
 ## Current State
 
-Performance, 1k-token prompt, 128 generated, same GPU, server-measured tokens per second
+Server measured tokens per second on one RTX 3080 Ti, 1k token prompt, 128 generated, llama.cpp at its best flags for the file.
 
-┌───────────────────────────────────────────────┬───────────────────┬───────────────┬────────────┬──────────────────┬───────────────┬────────────┐
-│                     Model                     │ llama.cpp prefill │ kungfu before │ kungfu now │ llama.cpp decode │ kungfu before │ kungfu now │
-├───────────────────────────────────────────────┼───────────────────┼───────────────┼────────────┼──────────────────┼───────────────┼────────────┤
-│ Qwen3-0.6B Q8_0                               │ 31270             │ 3903          │ 7057       │ 434              │ 313           │ 300        │
-├───────────────────────────────────────────────┼───────────────────┼───────────────┼────────────┼──────────────────┼───────────────┼────────────┤
-│ Llama-3.2-1B Q4_K_M                           │ 25427             │ 2327          │ 5328       │ 523              │ 265           │ 254        │
-├───────────────────────────────────────────────┼───────────────────┼───────────────┼────────────┼──────────────────┼───────────────┼────────────┤
-│ Qwen2.5-0.5B Q8_0                             │ 34308             │ 5583          │ 10359      │ 537              │ 377           │ 353        │
-├───────────────────────────────────────────────┼───────────────────┼───────────────┼────────────┼──────────────────┼───────────────┼────────────┤
-│ Gemma3-270m Q8_0                              │ 41200             │ 12794         │ 26302      │ 585              │ 403           │ 418        │
-├───────────────────────────────────────────────┼───────────────────┼───────────────┼────────────┼──────────────────┼───────────────┼────────────┤
-│ Qwen3-30B-A3B IQ2_XXS, experts partly on host │ 1424              │ 41            │ not rerun  │ 72               │ 10            │ not rerun  │
-└───────────────────────────────────────────────┴───────────────────┴───────────────┴────────────┴──────────────────┴───────────────┴────────────┘
+| Model | llama.cpp prefill | kungfu prefill | llama.cpp decode | kungfu decode |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 26319 | 29510 | 537 | 546 to 620 |
+| Qwen3-30B-A3B IQ2_XXS, experts partly on the device | 1296 | 3533 | 49 | 128 |
 
-The prefill change is the int8 tensor-core matmul. Every block quant type now gives `q16`, sixteen integers with a scale and offset, and `matmul_i8` runs a 64 by 64 by 64 tile through `mma.sync.m16n8k16.s8` on sm_80 and above. Activations are quantized once per product by `quant_act` into int8 with per sixteen scales and integer sums, the same integers `round_act` would multiply back, so each sixteen wide step is one exact integer product scaled once and the result still matches the CPU oracle at 1e-5 for all 27 block types. Rows of nine and more take this path, fewer rows keep the warp matvec. Floats and devices below sm_80 keep the fp32 tile. All 37 workspace tests pass, with the new one covering every int8 type at partial tiles and partial k steps with and without bias.
+Greedy top 1 agreement with llama.cpp over 320 teacher forced positions: Llama-3.2-1B 99.1 percent, Qwen3-30B-A3B 94.4 percent, where llama.cpp's own CPU backend agrees with its CUDA run at 96.2 percent on that file.
+
+The routed experts a layer's device slots miss are computed by host worker threads driven by the device through mapped memory, with no host synchronization inside a decode pass, see `docs/moe-coprocessor.md`. Prefill runs the slot resident experts in place and streams only the missing ones. Decode drafts a tree of tokens and verifies the whole tree in one pass, each row attending to its ancestors alone, see `docs/tree-verify.md`. The trees come from the context's own repeats and the model's recycled candidates, and from a draft head the server teaches itself on the rows it scores, saved beside the routing profile so a restart is warm, each round taking whichever drafter measures faster, see `docs/drafter.md`. On by default, `--speculate off` turns it off. The logits of a pass stay on the device and each row comes back as its top 64 candidates with the row's log sum exp, the whole row crossing only when a sampler proves it needs it, see `docs/candidates.md`.
 
 What is still short
 
-- Prefill is 3 to 5 times slower than llama.cpp. The int8 tile is a plain shared memory loop with no double buffering or ldmatrix, and the weight side still unpacks through scalar byte loads per sixteen. Attention is the other half at long prompts, a 2.5k prompt prefills at 4700 on Qwen3-0.6B against 7000 at 1.1k.
-- The MoE file is 7 times slower on decode and 35 times slower on prefill. The host-side expert path dequantizes every row per call through the generic oracle code, so the CPU side is the bottleneck, not the device. The expert matmul on the device still uses the fp32 tile and could take the int8 one.
-- Decode sits at 60 to 70 percent of llama.cpp. The remaining gap is about 750 kernel launches per token, mostly activation rounding before each matvec, which can be fused away.
+- Dense decode sits at parity. The persistent decode kernel runs 1.85 ms per token on Llama-3.2-1B against a 1.03 ms memory floor and is slower than graph replay, since every stage ends in a grid barrier. Per stage dependency counters, weight loads issued before the waits, and a short context attention path are the work.
+- The device side of a routed decode layer spends about 7 ms per token in 23 small launches where the memory floor is 1.7 ms. The expert products and the attention at short context are the largest.
+- A missed expert costs the host 65 to 80 us with 16 threads, bound by the codebook unpack of the two bit types, about half of memory speed. Natural text misses about 28 of 384 expert calls per token once the slots adapt.
+- A verify pass of 8 rows costs 1.4 decode steps on Llama-3.2-1B, 1.9 for 16 rows and 2.9 for 32, through the tensor core product on native bytes with the activations windowed in shared memory, see `docs/mm-i8.md`. With every drafted row standing that is 3480, 5120, and 6620 tokens per second against 604 one row at a time. The server decodes text that copies its context at 2.7 times the plain rate and code edits and open ended text at the plain rate, since the ngram drafter holds only on repeats, so the pass is no longer what bounds speculation and a drafter that holds on open text is. The multi row product runs at 400 to 600 GB/s against 650 to 800 for one row, issue bound at two blocks per multiprocessor.
+- The learned head drafts only where it measures faster than the ngram drafter and plain decoding, see `docs/drafter.md`. Trained offline on 1.2 million of Llama-3.2-1B's own tokens it accepts 0.72 tokens a round and is still learning, where a head pays for itself from about two accepted tokens a round, so the measure keeps the ngram drafter in charge and the head waits on the hours a process serves.

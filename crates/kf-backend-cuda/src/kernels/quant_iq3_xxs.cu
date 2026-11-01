@@ -39,4 +39,21 @@ struct Iq3Xxs {
     }
 };
 
+// Word form: four grid words signed in place, the low sign nibble over the first word of each pair
+template <>
+struct KfQ16<Iq3Xxs> {
+    static __device__ __forceinline__ void load(const u8* __restrict__ b, int g, int4& wv, float& d, float& m) {
+        int ib = g >> 1, l0 = (g & 1) * 2;
+        u32 aux = kf_u32(b + 66 + 4 * ib);
+        d = kf_f16(b) * (0.5f + (float)(aux >> 28)) * 0.5f;
+        m = 0.0f;
+        const u8* qs = b + 2 + 8 * ib + 2 * l0;
+        u32 s0 = ksigns_iq2xs[(aux >> (7 * l0)) & 127], s1 = ksigns_iq2xs[(aux >> (7 * (l0 + 1))) & 127];
+        wv.x = (int)kf_sign4(iq3xxs_grid[qs[0]], s0);
+        wv.y = (int)kf_sign4(iq3xxs_grid[qs[1]], s0 >> 4);
+        wv.z = (int)kf_sign4(iq3xxs_grid[qs[2]], s1);
+        wv.w = (int)kf_sign4(iq3xxs_grid[qs[3]], s1 >> 4);
+    }
+};
+
 KF_QUANT_KERNELS_I8(Iq3Xxs)

@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         let graph = g.finish(last);
         let inputs = Inputs { tokens: ids.clone(), positions: (0..ids.len() as u32).collect(), ..Default::default() };
         for choice in [BackendChoice::Cpu, BackendChoice::Cuda { device: 0 }] {
-            let mut p = kf_engine::prepare(&loaded, choice, CtxChoice::Tokens(4096), 512, 1, None, None, None, &kf_engine::Scope::all(loaded.model.n_layers()))?;
+            let mut p = kf_engine::prepare(&loaded, choice, CtxChoice::Tokens(4096), 512, 1, None, None, None, &kf_engine::Scope::all(loaded.model.n_layers()), 0)?;
             let out = p.backend.run(&graph, &inputs, loaded.store.as_ref())?;
             println!("{choice:?}: {:?}", &out[..4]);
         }
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         let inputs = Inputs { tokens: ids.clone(), positions: (0..ids.len() as u32).collect(), ..Default::default() };
         let mut rows = Vec::new();
         for choice in [BackendChoice::Cpu, BackendChoice::Cuda { device: 0 }] {
-            let mut p = kf_engine::prepare(&loaded, choice, CtxChoice::Tokens(4096), 512, 1, None, None, None, &kf_engine::Scope::all(loaded.model.n_layers()))?;
+            let mut p = kf_engine::prepare(&loaded, choice, CtxChoice::Tokens(4096), 512, 1, None, None, None, &kf_engine::Scope::all(loaded.model.n_layers()), 0)?;
             rows.push(p.backend.run(&graph, &inputs, loaded.store.as_ref())?);
         }
         let (a, b) = (&rows[0], &rows[1]);

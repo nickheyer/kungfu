@@ -5,6 +5,7 @@ pub mod chat;
 pub mod describe;
 pub mod engine;
 pub mod grammar;
+pub mod head;
 pub mod params;
 pub mod parse;
 pub mod responses;

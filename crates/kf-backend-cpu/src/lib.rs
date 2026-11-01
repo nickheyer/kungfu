@@ -1,11 +1,14 @@
 //! Reference backend, every op in plain f32 on the host, the parity oracle for every other backend
 pub mod attention;
+pub mod drafter;
+pub mod experts;
 pub mod hyper;
 pub mod moe;
 pub mod ops;
 pub mod recurrent;
 pub mod rope;
 pub mod sparse;
+pub mod train;
 
 use anyhow::{Result, anyhow, bail};
 use kf_core::{AllocKind, Backend, Graph, Inputs, Op, Plan, Pool, WeightSource, Wid};
@@ -63,6 +66,16 @@ impl KvLayer {
     pub fn v_row(&self, j: usize) -> &[half::f16] {
         let s = (j % self.cap) * self.v_width;
         &self.v[s..s + self.v_width]
+    }
+
+    pub fn k_row_mut(&mut self, j: usize) -> &mut [half::f16] {
+        let s = (j % self.cap) * self.k_width;
+        &mut self.k[s..s + self.k_width]
+    }
+
+    pub fn v_row_mut(&mut self, j: usize) -> &mut [half::f16] {
+        let s = (j % self.cap) * self.v_width;
+        &mut self.v[s..s + self.v_width]
     }
 
     /// The ring with only the live rows kept, every row when positions have wrapped around it
@@ -183,6 +196,14 @@ pub struct CpuBackend {
     pub n_batch: usize,
     /// State bytes reported so far, the next report logs the growth since
     state_bytes: u64,
+    /// The rows the last pass's final top k read, when it ended in one
+    dense: Option<Buf>,
+    /// The residual rows before the final norm the last pass kept
+    hidden: Option<Buf>,
+    /// The draft head, once started
+    drafter: Option<drafter::CpuDrafter>,
+    /// The slot and token of every row of the last tree pass, which compaction hands the drafter along the kept path
+    tree_tokens: Vec<(u32, u32)>,
 }
 
 impl Default for CpuBackend {
@@ -193,7 +214,7 @@ impl Default for CpuBackend {
 
 impl CpuBackend {
     pub fn new() -> Self {
-        Self { seqs: vec![SeqState::default()], cur: 0, small: HashMap::new(), n_ctx: 0, n_batch: 0, state_bytes: 0 }
+        Self { seqs: vec![SeqState::default()], cur: 0, small: HashMap::new(), n_ctx: 0, n_batch: 0, state_bytes: 0, dense: None, hidden: None, drafter: None, tree_tokens: Vec::new() }
     }
 
     /// Sizes every cache made from now on for a context length and a largest pass, with the slots given
@@ -402,10 +423,139 @@ impl Backend for CpuBackend {
         }
         self.account_state();
         let out = g.output.ok_or_else(|| anyhow!("graph has no output"))?;
+        let topk = g.nodes.iter().find(|n| n.out == out).filter(|n| matches!(n.op, Op::TopK { .. })).map(|n| n.inputs[0]);
+        self.dense = topk.and_then(|tid| t[tid.0 as usize].take());
+        self.hidden = g.hidden.and_then(|tid| t.get(tid.0 as usize).cloned().flatten());
+        if let (Some(h), Some(d)) = (self.hidden.as_ref(), self.drafter.as_mut()) {
+            let n = inputs.tokens.len();
+            let first = n - h.rows.min(n);
+            if inputs.tree.is_empty() {
+                for (k, r) in (first..n).enumerate() {
+                    d.append(inputs.seq_of(r), inputs.positions[r], inputs.tokens[r], h.row(k).to_vec());
+                }
+            } else {
+                self.tree_tokens = (first..n).map(|r| (inputs.seq_of(r) as u32, inputs.tokens[r])).collect();
+            }
+        }
         Ok(t[out.0 as usize].take().ok_or_else(|| anyhow!("tensor {} used before it was computed", out.0))?.data)
     }
 
+    fn dense_row(&mut self, row: usize) -> Result<Vec<f32>> {
+        let d = self.dense.as_ref().ok_or_else(|| anyhow!("the last pass ended in no top k"))?;
+        if row >= d.rows {
+            bail!("row {row} of {} dense rows", d.rows);
+        }
+        Ok(d.row(row).to_vec())
+    }
+
+    fn hidden_rows(&mut self) -> Result<Vec<f32>> {
+        Ok(self.hidden.as_ref().ok_or_else(|| anyhow!("the last pass kept no hidden rows"))?.data.clone())
+    }
+
+    fn drafter_start(&mut self, cfg: kf_core::HeadConfig, embed: Wid, head: Wid, n_vocab: usize, draft_vocab: usize, batch: usize, weights: &dyn WeightSource) -> Result<()> {
+        let embd = dequant_all(embed, weights)?;
+        let rows = if head == embed { embd.clone() } else { dequant_all(head, weights)? };
+        self.drafter = Some(drafter::CpuDrafter::new(cfg, self.seqs.len(), embd, rows, n_vocab, draft_vocab, batch, 16384)?);
+        Ok(())
+    }
+
+    fn drafter_step(&mut self) -> Result<Option<kf_core::TrainStep>> {
+        Ok(self.drafter.as_mut().and_then(|d| d.step(kf_core::HEAD_CHUNK)))
+    }
+
+    fn drafter_rows(&self) -> u64 {
+        self.drafter.as_ref().map_or(0, |d| d.appended)
+    }
+
+    fn drafter_hold(&mut self, seq: usize, row: usize, pos: u32) -> Result<()> {
+        let h = self.hidden.as_ref().ok_or_else(|| anyhow!("the last pass kept no hidden rows"))?;
+        if row >= h.rows {
+            bail!("row {row} of {} hidden rows", h.rows);
+        }
+        let feat = h.row(row).to_vec();
+        if let Some(d) = self.drafter.as_mut() {
+            d.hold(seq, feat, pos);
+        }
+        Ok(())
+    }
+
+    fn drafter_sync(&mut self, seq: usize) -> Result<()> {
+        if let Some(d) = self.drafter.as_mut() {
+            d.sync(seq);
+        }
+        Ok(())
+    }
+
+    fn drafter_draft(&mut self, seq: usize, own: u32, budget: usize) -> Result<kf_core::Tree> {
+        Ok(self.drafter.as_ref().map_or_else(|| kf_core::Tree::root(own), |d| d.draft(seq, own, budget)))
+    }
+
+    fn drafter_refresh_vocab(&mut self) -> Result<()> {
+        if let Some(d) = self.drafter.as_mut() {
+            d.refresh_vocab();
+        }
+        Ok(())
+    }
+
+    fn drafter_save(&mut self) -> Result<Vec<u8>> {
+        let d = self.drafter.as_ref().ok_or_else(|| anyhow!("no draft head to save"))?;
+        Ok(kf_core::head_save(&d.head.cfg, &d.vocab, &d.head.params))
+    }
+
+    fn drafter_load(&mut self, bytes: &[u8]) -> Result<()> {
+        let d = self.drafter.as_mut().ok_or_else(|| anyhow!("no draft head to load into"))?;
+        let (vocab, params) = kf_core::head_load(&d.head.cfg, bytes)?;
+        d.head = drafter::CpuHead::with_params(d.head.cfg, params)?;
+        d.vocab = vocab;
+        Ok(())
+    }
+
+    fn compact(&mut self, seq: usize, base: usize, keep: &[usize]) -> Result<()> {
+        let Some(s) = self.seqs.get_mut(seq) else { bail!("sequence slot {seq} of {}", self.seqs.len()) };
+        for (i, k) in keep.iter().enumerate() {
+            if *k < i {
+                bail!("kept row {k} stands before its place {i}");
+            }
+        }
+        if s.layers.values().any(|st| st.has_recurrent()) {
+            bail!("a recurrent state has no rows to compact");
+        }
+        for st in s.layers.values_mut() {
+            let Some(kv) = &mut st.kv else { continue };
+            if keep.iter().any(|k| base + k >= kv.n) {
+                bail!("kept row past the {} rows of the cache", kv.n);
+            }
+            let rows: Vec<(Vec<half::f16>, Vec<half::f16>)> = keep.iter().map(|k| (kv.k_row(base + k).to_vec(), kv.v_row(base + k).to_vec())).collect();
+            for (i, (k, v)) in rows.into_iter().enumerate() {
+                kv.k_row_mut(base + i).copy_from_slice(&k);
+                kv.v_row_mut(base + i).copy_from_slice(&v);
+            }
+        }
+        let kept: Vec<u32> = keep.iter().filter_map(|k| s.tokens.get(base + k).copied()).collect();
+        if let (Some(h), Some(d)) = (self.hidden.as_ref(), self.drafter.as_mut())
+            && self.tree_tokens.len() == h.rows
+        {
+            let tokens = std::mem::take(&mut self.tree_tokens);
+            for (i, k) in keep.iter().enumerate() {
+                if let Some((_, token)) = tokens.get(*k) {
+                    d.append(seq, (base + i) as u32, *token, h.row(*k).to_vec());
+                }
+            }
+        }
+        kf_core::Backend::truncate(self, seq, base + keep.len())?;
+        let Some(s) = self.seqs.get_mut(seq) else { bail!("sequence slot {seq} of {}", self.seqs.len()) };
+        for (i, t) in kept.into_iter().enumerate() {
+            if let Some(slot) = s.tokens.get_mut(base + i) {
+                *slot = t;
+            }
+        }
+        Ok(())
+    }
+
     fn truncate(&mut self, seq: usize, n: usize) -> Result<()> {
+        if let Some(d) = self.drafter.as_mut() {
+            d.roll_back(seq);
+        }
         let Some(s) = self.seqs.get_mut(seq) else { bail!("sequence slot {seq} of {}", self.seqs.len()) };
         if n == 0 {
             self.reset_seq(seq);
@@ -440,6 +590,11 @@ impl Backend for CpuBackend {
     }
 
     fn reset(&mut self) {
+        for seq in 0..self.seqs.len() {
+            if let Some(d) = self.drafter.as_mut() {
+                d.roll_back(seq);
+            }
+        }
         for s in &mut self.seqs {
             *s = SeqState::default();
         }
@@ -448,6 +603,9 @@ impl Backend for CpuBackend {
     }
 
     fn reset_seq(&mut self, seq: usize) {
+        if let Some(d) = self.drafter.as_mut() {
+            d.roll_back(seq);
+        }
         if let Some(s) = self.seqs.get_mut(seq) {
             *s = SeqState::default();
         }
@@ -459,6 +617,9 @@ impl Backend for CpuBackend {
     }
 
     fn load_state(&mut self, seq: usize, bytes: &[u8]) -> Result<()> {
+        if let Some(d) = self.drafter.as_mut() {
+            d.roll_back(seq);
+        }
         self.restore(seq, SavedState::from_bytes(bytes)?)
     }
 }

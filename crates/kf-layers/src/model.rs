@@ -155,6 +155,7 @@ impl Model {
         if let Some(p) = &self.pre_head {
             x = p.forward(g, x, &ctx)?;
         }
+        g.keep_hidden(x);
         let x = self.final_norm.forward(g, x, &ctx)?;
         let mut l = self.head.apply(g, x);
         l = g.scale(l, self.logit_scale);

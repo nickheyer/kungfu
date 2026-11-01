@@ -1,8 +1,61 @@
 use crate::types::{f16_at, scale_min_k4};
-use crate::{Quant, TypeInfo};
+use crate::{ActI8, Quant, TypeInfo};
 
 pub static INFO: TypeInfo = TypeInfo { id: 12, name: "q4_K", block: 256, size: 144 };
 pub struct Q4K;
+
+/// Rows r0 on of the activations against one row, each pair of nibble sub blocks unpacked once for every row
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2<const R: usize>(src: &[u8], x: &ActI8, r0: usize, y: &mut [f32]) {
+    use crate::simd::hsum_ps;
+    use std::arch::x86_64::*;
+    let (n, n16) = (x.n, x.n / 16);
+    let m4 = _mm256_set1_epi8(0xf);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for (b, blk) in src.chunks_exact(144).enumerate() {
+        let d = f16_at(blk, 0);
+        let dmin = f16_at(blk, 2);
+        let mut sc = [0i16; 8];
+        let mut mn = [0i32; 16];
+        for s in 0..8 {
+            let (a, m) = scale_min_k4(s, &blk[4..16]);
+            sc[s] = a as i16;
+            mn[2 * s] = m as i32;
+            mn[2 * s + 1] = m as i32;
+        }
+        let mlo = unsafe { _mm256_loadu_si256(mn.as_ptr() as *const __m256i) };
+        let mhi = unsafe { _mm256_loadu_si256(mn.as_ptr().add(8) as *const __m256i) };
+        let mut sumi = [_mm256_setzero_si256(); R];
+        for j in 0..4 {
+            let q = unsafe { _mm256_loadu_si256(blk.as_ptr().add(16 + 32 * j) as *const __m256i) };
+            let lo = _mm256_and_si256(q, m4);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+            let slo = _mm256_set1_epi16(sc[2 * j]);
+            let shi = _mm256_set1_epi16(sc[2 * j + 1]);
+            for r in 0..R {
+                let at = (r0 + r) * n + b * 256 + 64 * j;
+                let q0 = unsafe { _mm256_loadu_si256(x.q.as_ptr().add(at) as *const __m256i) };
+                let q1 = unsafe { _mm256_loadu_si256(x.q.as_ptr().add(at + 32) as *const __m256i) };
+                let p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, q0), slo);
+                let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, q1), shi);
+                sumi[r] = _mm256_add_epi32(sumi[r], _mm256_add_epi32(p0, p1));
+            }
+        }
+        for r in 0..R {
+            let at = (r0 + r) * n16 + b * 16;
+            let s0 = unsafe { _mm256_loadu_si256(x.sum.as_ptr().add(at) as *const __m256i) };
+            let s1 = unsafe { _mm256_loadu_si256(x.sum.as_ptr().add(at + 8) as *const __m256i) };
+            let mins = _mm256_add_epi32(_mm256_mullo_epi32(s0, mlo), _mm256_mullo_epi32(s1, mhi));
+            let dx = x.d[at];
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d * dx), _mm256_cvtepi32_ps(sumi[r]), acc[r]);
+            acc[r] = _mm256_fnmadd_ps(_mm256_set1_ps(dmin * dx), _mm256_cvtepi32_ps(mins), acc[r]);
+        }
+    }
+    for r in 0..R {
+        y[r0 + r] = hsum_ps(acc[r]);
+    }
+}
 
 impl Quant for Q4K {
     fn info(&self) -> &'static TypeInfo {
@@ -54,5 +107,12 @@ impl Quant for Q4K {
             }
         }
         acc
+    }
+    fn dot_i8(&self, src: &[u8], x: &ActI8, y: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::simd::have() {
+            return crate::simd::avx2_rows!(dot_avx2, src, x, y);
+        }
+        crate::dot_i8_generic(self, src, x, y)
     }
 }

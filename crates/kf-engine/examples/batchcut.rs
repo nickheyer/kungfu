@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     for cut in args[4].split(',') {
         let mut outs = Vec::new();
         for toks in [forced.clone(), forced[..1].to_vec()] {
-            let p = kf_engine::prepare(&loaded, choice, CtxChoice::Tokens(4096), 512, 1, None, None, None, &scope)?;
+            let p = kf_engine::prepare(&loaded, choice, CtxChoice::Tokens(4096), 512, 1, None, None, None, &scope, 0)?;
             let mut s = Session::new(&loaded, p.backend, &p.plan);
             s.feed(0, &prompt)?;
             let mut g = GraphBuilder::new();

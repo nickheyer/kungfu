@@ -26,4 +26,10 @@ struct Q2K {
     }
 };
 
+// Each group's integers sit above an offset the product takes off
+template <>
+struct KfOffset<Q2K> {
+    static constexpr bool V = true;
+};
+
 KF_QUANT_KERNELS_I8(Q2K)

@@ -50,20 +50,20 @@ pub fn pick(scores: &[f32], n_used: usize, groups: Option<Groups>) -> Vec<usize>
     idx
 }
 
-struct ExpertWeights<'a> {
-    gate: Option<Wid>,
-    up: Wid,
-    down: Option<Wid>,
-    gate_b: Option<&'a [f32]>,
-    up_b: Option<&'a [f32]>,
-    down_b: Option<&'a [f32]>,
-    fused: bool,
-    act: Act,
-    limit: Option<GluLimit>,
+pub(crate) struct ExpertWeights<'a> {
+    pub(crate) gate: Option<Wid>,
+    pub(crate) up: Wid,
+    pub(crate) down: Option<Wid>,
+    pub(crate) gate_b: Option<&'a [f32]>,
+    pub(crate) up_b: Option<&'a [f32]>,
+    pub(crate) down_b: Option<&'a [f32]>,
+    pub(crate) fused: bool,
+    pub(crate) act: Act,
+    pub(crate) limit: Option<GluLimit>,
 }
 
 /// One expert applied to one row, gated hidden then the down projection when one exists
-fn expert_forward(w: &ExpertWeights, weights: &dyn WeightSource, e: usize, x: &[f32]) -> Result<Vec<f32>> {
+pub(crate) fn expert_forward(w: &ExpertWeights, weights: &dyn WeightSource, e: usize, x: &[f32]) -> Result<Vec<f32>> {
     let hidden = match w.gate {
         Some(g) => {
             let mut gt = expert_matvec(g, weights, e, x)?;

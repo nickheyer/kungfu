@@ -34,4 +34,22 @@ struct Iq2Xxs {
     }
 };
 
+// Word form: the two grid entries of the group signed in place as four words
+template <>
+struct KfQ16<Iq2Xxs> {
+    static __device__ __forceinline__ void load(const u8* __restrict__ b, int g, int4& wv, float& d, float& m) {
+        int ib = g >> 1, l0 = (g & 1) * 2;
+        u32 aux0 = kf_u32(b + 2 + 8 * ib), aux1 = kf_u32(b + 6 + 8 * ib);
+        d = kf_f16(b) * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+        m = 0.0f;
+        u32 lo, hi;
+        kf_grid8(iq2xxs_grid[(aux0 >> (8 * l0)) & 0xFF], ksigns_iq2xs[(aux1 >> (7 * l0)) & 127], lo, hi);
+        wv.x = (int)lo;
+        wv.y = (int)hi;
+        kf_grid8(iq2xxs_grid[(aux0 >> (8 * (l0 + 1))) & 0xFF], ksigns_iq2xs[(aux1 >> (7 * (l0 + 1))) & 127], lo, hi);
+        wv.z = (int)lo;
+        wv.w = (int)hi;
+    }
+};
+
 KF_QUANT_KERNELS_I8(Iq2Xxs)

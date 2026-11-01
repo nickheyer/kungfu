@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "attention_decode.cuh"
 
 #define KF_AT_WARPS 4
 #define KF_AT_V 16
@@ -21,6 +22,25 @@ extern "C" __global__ void kv_append(const float* k, const float* v, u16* kc, u1
     }
 }
 
+// Moves the cache rows base plus idx[i] of one slot to base plus i, one block reading every kept row before any is
+// written, so a row a later index keeps is never overwritten first
+extern "C" __global__ void kv_compact(u16* kc, u16* vc, int cap, int kw, int vw, int seq, int base, const int* idx, int n) {
+    extern __shared__ __align__(16) u16 held[];
+    const int per = kw + vw;
+    for (int t = threadIdx.x; t < n * per; t += blockDim.x) {
+        const int i = t / per, c = t - i * per;
+        const i64 slot = (i64)seq * cap + ((base + idx[i]) % cap);
+        held[t] = c < kw ? kc[slot * kw + c] : vc[slot * vw + (c - kw)];
+    }
+    __syncthreads();
+    for (int t = threadIdx.x; t < n * per; t += blockDim.x) {
+        const int i = t / per, c = t - i * per;
+        const i64 slot = (i64)seq * cap + ((base + i) % cap);
+        if (c < kw) kc[slot * kw + c] = held[t];
+        else vc[slot * vw + (c - kw)] = held[t];
+    }
+}
+
 // Dot of the query in shared memory with one half precision key row, eight elements per vector load when the width allows
 __device__ __forceinline__ float kf_at_score(const float* qs, const u16* kj, int hd, bool vec) {
     float d = 0.0f;
@@ -39,14 +59,21 @@ __device__ __forceinline__ float kf_at_score(const float* qs, const u16* kj, int
     return d;
 }
 
-// Online softmax of one warp over tiles of 32 keys, one key per lane scored at once, values accumulated in key order with half precision rounding
+// The three words of a row of a tree pass as the decode kernel reads them, see kf_attention_decode, every key seen
+// when the pass is no tree
+__device__ __forceinline__ unsigned long long kf_at_tree_mask(const int* tree, int r) {
+    return tree ? ((unsigned long long)(u32)tree[3 * r] | ((unsigned long long)(u32)tree[3 * r + 1] << 32)) : ~0ull;
+}
+
+// Online softmax of one warp over tiles of 32 keys, one key per lane scored at once, values accumulated in key order
+// with half precision rounding, the keys within 64 of the row's last key hi_row seen as the tree mask says
 template <int NV>
-__device__ __forceinline__ void kf_at_tiles(const float* qs, const u16* kb, const u16* vb, i64 kw, i64 vw, int hd, int hdv, int cap, int base, int lo, int hi, float scale, float softcap, float& m, float& l, float* acc) {
+__device__ __forceinline__ void kf_at_tiles(const float* qs, const u16* kb, const u16* vb, i64 kw, i64 vw, int hd, int hdv, int cap, int base, int lo, int hi, int hi_row, unsigned long long tmask, float scale, float softcap, float& m, float& l, float* acc) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     bool vec = (hd & 7) == 0;
     for (int j0 = lo + warp * 32; j0 <= hi; j0 += KF_AT_WARPS * 32) {
         int j = j0 + lane;
-        bool ok = j <= hi;
+        bool ok = j <= hi && (hi_row - j >= 64 || ((tmask >> (hi_row - j)) & 1ull));
         float s = KF_NEG_INF;
         if (ok) {
             i64 idx = cap > 0 ? (i64)(j % cap) : (i64)(j - base);
@@ -106,7 +133,7 @@ __device__ __forceinline__ void kf_at_finish(float m, float l, const float* acc,
 
 #define KF_AT_RUN(NV)                                                                                                       \
     {                                                                                                                       \
-        kf_at_tiles<NV>(qs, kb, vb, kw, vw, hd, hdv, cap, base, lo, hi, scale, softcap, m, l, acc);                         \
+        kf_at_tiles<NV>(qs, kb, vb, kw, vw, hd, hdv, cap, base, lo, hi, hi_row, tmask, scale, softcap, m, l, acc);          \
         kf_at_finish<NV>(m, l, acc, ms, ls, accs, hdv, sinks, h, orow, prow);                                               \
     }
 
@@ -114,7 +141,7 @@ __device__ __forceinline__ void kf_at_finish(float m, float l, const float* acc,
     if (hdv <= 32) KF_AT_RUN(1) else if (hdv <= 64) KF_AT_RUN(2) else if (hdv <= 128) KF_AT_RUN(4) else if (hdv <= 256) KF_AT_RUN(8) else KF_AT_RUN(16)
 
 // Causal attention of one head and row over the half precision ring cache, the keys of grid depth z's part, written to the output when there is one part and as a partial otherwise
-extern "C" __global__ void attention(const float* q, const u16* kc, const u16* vc, const int* pos_in, const int* seq, const int* attend, const float* sinks, float* out, float* parts, int part_keys, int n_head, int n_head_kv, int hd, int hdv, float scale, int window, float softcap, int cap) {
+extern "C" __global__ void attention(const float* q, const u16* kc, const u16* vc, const int* pos_in, const int* seq, const int* attend, const float* sinks, float* out, float* parts, int part_keys, int n_head, int n_head_kv, int hd, int hdv, float scale, int window, float softcap, int cap, const int* tree) {
     extern __shared__ float smem[];
     float* qs = smem;
     float* ms = qs + hd;
@@ -123,10 +150,15 @@ extern "C" __global__ void attention(const float* q, const u16* kc, const u16* v
     int r = blockIdx.x, h = blockIdx.y, part = blockIdx.z;
     int pos = pos_in[r];
     int hi = max(pos, attend[r]);
-    int lo = window > 0 ? max(0, pos - (window - 1)) : 0;
+    const int hi_row = hi;
+    const unsigned long long tmask = kf_at_tree_mask(tree, r);
+    const int wpos = tree ? tree[3 * r + 2] : pos;
+    int lo = window > 0 ? max(0, wpos - (window - 1)) : 0;
+    // Parts split the row's own key range, which starts past zero and can run past the ring size under a window
     if (gridDim.z > 1) {
-        lo = max(lo, part * part_keys);
-        hi = min(hi, part * part_keys + part_keys - 1);
+        int base = lo;
+        lo = base + part * part_keys;
+        hi = min(hi, base + part * part_keys + part_keys - 1);
     }
     int group = n_head / max(n_head_kv, 1);
     int hk = h / group;
@@ -153,7 +185,7 @@ extern "C" __global__ void attention_clear(float* parts, i64 n, int width) {
 }
 
 // Partial attention of one head and row over key positions jlo through jhi held contiguously from base or in a ring of cap rows per slot, written as maximum, sum, and unnormalized accumulator
-extern "C" __global__ void attention_part(const float* q, const u16* kb_in, const u16* vb_in, const int* pos_in, const int* seq, const int* attend, int row0, int base, int cap, int jlo, int jhi, float* parts, int part, int rows_total, int n_head, int n_head_kv, int hd, int hdv, float scale, int window, float softcap) {
+extern "C" __global__ void attention_part(const float* q, const u16* kb_in, const u16* vb_in, const int* pos_in, const int* seq, const int* attend, int row0, int base, int cap, int jlo, int jhi, float* parts, int part, int rows_total, int n_head, int n_head_kv, int hd, int hdv, float scale, int window, float softcap, const int* tree) {
     extern __shared__ float smem[];
     float* qs = smem;
     float* ms = qs + hd;
@@ -161,8 +193,11 @@ extern "C" __global__ void attention_part(const float* q, const u16* kb_in, cons
     float* accs = ls + KF_AT_WARPS;
     int r = row0 + blockIdx.x, h = blockIdx.y;
     int pos = pos_in[r];
-    int start = window > 0 ? max(0, pos - (window - 1)) : 0;
-    int lo = max(jlo, start), hi = min(jhi, max(pos, attend[r]));
+    const int hi_row = max(pos, attend[r]);
+    const unsigned long long tmask = kf_at_tree_mask(tree, r);
+    const int wpos = tree ? tree[3 * r + 2] : pos;
+    int start = window > 0 ? max(0, wpos - (window - 1)) : 0;
+    int lo = max(jlo, start), hi = min(jhi, hi_row);
     int group = n_head / max(n_head_kv, 1);
     int hk = h / group;
     i64 kw = (i64)n_head_kv * hd, vw = (i64)n_head_kv * hdv;
@@ -260,3 +295,17 @@ extern "C" __global__ void attention_full(const float* q, const float* k, const 
         orow[i] = o / tot;
     }
 }
+
+#define KF_AT_DECODE(HD)                                                                                                                                                 \
+    extern "C" __global__ void __launch_bounds__(KF_DEC_THREADS) attention_decode_hd##HD(const float* q, u16* kc, u16* vc, const int* pos, const int* seq, const int* attend, \
+                                                                              const float* sinks, float* out, float* parts, int n_head, int n_head_kv, float scale, int window, \
+                                                                              float softcap, int cap, int rows, int* counters, int kind, i8* qo, float* s16o, float* m16o, float* s32o, float* m32o, \
+                                                                              const float* k_in, const float* v_in, const int* rope4, const float2* cst, int half, int neox, float mscale, int mode, int s0, int s1, int s2, int sect, \
+                                                                              int norm_q, const float* wq, const float* bq, float eps_q, int norm_k, const float* wk, const float* bk, float eps_k, const int* tree) { \
+        kf_attention_decode<HD, 4, 8, 4>(blockIdx.x, blockIdx.y, blockIdx.z, gridDim.y, gridDim.z, q, kc, vc, pos, seq, attend, sinks, out, parts, n_head, n_head_kv, scale, window, softcap, cap, rows, counters, kind, qo, s16o, m16o, s32o, m32o, \
+                                k_in, v_in, rope4, cst, half, neox, mscale, mode, s0, s1, s2, sect, norm_q, wq, bq, eps_q, norm_k, wk, bk, eps_k, tree);                        \
+    }
+
+KF_AT_DECODE(64)
+KF_AT_DECODE(128)
+KF_AT_DECODE(256)

@@ -185,7 +185,7 @@ impl Gguf {
         let mut shards = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             let file = File::open(p).with_context(|| format!("open {}", p.display()))?;
-            let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("map {}", p.display()))?;
+            let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file) }.with_context(|| format!("map {}", p.display()))?;
             let parsed = parse_header(&mmap).with_context(|| format!("parse {}", p.display()))?;
             if i == 0 {
                 meta = parsed.meta;

@@ -8,8 +8,33 @@ use std::collections::BTreeMap;
 pub const CTX_MIN: usize = 256;
 pub const CTX_STEP: usize = 256;
 
-/// Fraction of a pool's free memory the plan may fill, the rest stays for activations and scratch
+/// Fraction of a pool's free memory the plan may fill when the compute estimate asks for less
 pub const POOL_FILL: f64 = 0.9;
+
+/// Device bytes the runtime takes beside weights and state whatever the model: loaded kernel modules, captured graphs,
+/// the expert staging buffers, the KF8 unpack scratch, and attention partials
+const RUNTIME_BYTES: u64 = 640 << 20;
+
+/// Activation buffers alive at once in a pass, each a batch of rows at the widest activation
+const LIVE_ACTIVATIONS: u64 = 48;
+
+/// Bytes a pool keeps free for activations and scratch at a batch size: the runtime bytes, the live activations of the
+/// widest row, one batch of logits, the expert scratch of a routed layer, and never less than the fill fraction leaves
+pub fn compute_reserve(loaded: &Loaded, n_batch: usize, free: u64) -> u64 {
+    let h = &loaded.hparams;
+    let n_ff = h.n_ff.max(h.n_ff_arr.iter().copied().max().unwrap_or(0));
+    let widest = h.n_embd.max(n_ff) as u64;
+    let activations = LIVE_ACTIVATIONS * n_batch as u64 * widest * 4 + n_batch as u64 * h.n_vocab as u64 * 4;
+    let n_ff_exp = h.n_ff_exp_arr.iter().copied().max().unwrap_or(0) as u64;
+    let n_used = h.n_expert_used_arr.iter().copied().max().unwrap_or(0) as u64;
+    let routed = n_batch as u64 * n_used * (4 * n_ff_exp + h.n_embd as u64) * 4;
+    (RUNTIME_BYTES + activations + routed).max(free - (free as f64 * POOL_FILL) as u64)
+}
+
+/// The bytes of a pool a plan may fill at a batch size
+pub fn pool_budget(loaded: &Loaded, n_batch: usize, free: u64) -> u64 {
+    free.saturating_sub(compute_reserve(loaded, n_batch, free))
+}
 
 /// The layers one process holds in order and whether it holds the head, the whole model for a solo run
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,7 +209,7 @@ pub fn plan_with(loaded: &Loaded, choice: BackendChoice, n_ctx: usize, n_batch: 
             let (layers, _) = layer_bytes(loaded, n_ctx, n_batch, n_seq);
             let weights = scope_outside(loaded, scope) + scope.layers().map(|l| layers.get(&l).map_or(0, |lb| lb.dense + lb.experts)).sum::<u64>();
             let state = state_bytes(loaded, n_ctx, n_batch, n_seq, scope);
-            let budget = (free_bytes as f64 * POOL_FILL) as u64;
+            let budget = pool_budget(loaded, n_batch, free_bytes);
             if weights + state > budget {
                 bail!("host has {budget} bytes free for {weights} bytes of weights and {state} of state at {n_ctx} tokens");
             }
@@ -206,7 +231,7 @@ pub fn plan_with(loaded: &Loaded, choice: BackendChoice, n_ctx: usize, n_batch: 
 pub fn plan_device_placement(loaded: &Loaded, device: usize, n_ctx: usize, n_batch: usize, n_seq: usize, free_bytes: u64, scope: &Scope) -> Result<Plan> {
     let (layers, _) = layer_bytes(loaded, n_ctx, n_batch, n_seq);
     let outside = scope_outside(loaded, scope);
-    let budget = (free_bytes as f64 * POOL_FILL) as u64;
+    let budget = pool_budget(loaded, n_batch, free_bytes);
     if outside > budget {
         bail!("device {device} has {budget} bytes free for a model whose embedding and head need {outside}");
     }
@@ -243,19 +268,8 @@ pub fn plan_device_placement(loaded: &Loaded, device: usize, n_ctx: usize, n_bat
         }
     }
     let mut pinned = Vec::new();
-    let mut cached: Vec<usize> = Vec::new();
-    for lp in plan.iter_mut() {
-        let lb = layers.get(&lp.layer).cloned().unwrap_or_default();
-        if lb.n_expert == 0 || lp.weights != dev {
-            continue;
-        }
-        if cached.is_empty() && lb.experts <= left {
-            left -= lb.experts;
-            device_weights += lb.experts;
-            continue;
-        }
-        cached.push(lp.layer);
-    }
+    let moe: Vec<usize> = plan.iter().filter(|lp| lp.weights == dev && layers.get(&lp.layer).is_some_and(|lb| lb.n_expert > 0)).map(|lp| lp.layer).collect();
+    let all_experts: u64 = moe.iter().map(|l| layers.get(l).map_or(0, |lb| lb.experts)).sum();
     let host_state: u64 = plan.iter().filter(|lp| lp.kv_resident > 0).map(|lp| layers.get(&lp.layer).map_or(0, |lb| lb.state - lb.state_resident(lp.kv_resident))).sum();
     if host_state > 0 {
         let (host_free, _) = host_memory();
@@ -264,28 +278,31 @@ pub fn plan_device_placement(loaded: &Loaded, device: usize, n_ctx: usize, n_bat
             bail!("the cache rows past the resident windows need {host_state} bytes of host memory, {host_budget} are free");
         }
     }
-    let mut i = 0;
-    while i < cached.len() {
-        let share = left / (cached.len() - i) as u64;
-        let lb = layers.get(&cached[i]).cloned().unwrap_or_default();
-        let per_expert = (lb.experts / lb.n_expert as u64).max(1);
-        let slots = ((share / per_expert) as usize).min(lb.n_expert);
-        let lp = plan.iter_mut().find(|l| l.layer == cached[i]).expect("cached layer in the plan");
-        if slots == 0 {
-            let state = state_of.get(&lp.layer).copied().unwrap_or(0);
-            lp.weights = Pool::Host;
-            lp.state = Pool::Host;
-            lp.kv_resident = 0;
-            device_weights -= lb.dense;
-            device_state -= state;
-            left += lb.dense + state;
-        } else {
-            left -= slots as u64 * per_expert;
-            device_weights += slots as u64 * per_expert;
-            lp.expert_cache_slots = slots;
-            pinned.extend(lb.expert_wids.iter().copied());
+    if all_experts <= left {
+        device_weights += all_experts;
+    } else {
+        // Every routed layer keeps the same share of its experts in slots, the rest come from the host through the coprocessor
+        let share = left as f64 / all_experts as f64;
+        for lp in plan.iter_mut() {
+            let lb = layers.get(&lp.layer).cloned().unwrap_or_default();
+            if lb.n_expert == 0 || lp.weights != dev {
+                continue;
+            }
+            let per_expert = (lb.experts / lb.n_expert as u64).max(1);
+            let slots = ((share * lb.n_expert as f64).floor() as usize).min(lb.n_expert);
+            if slots == 0 {
+                let state = state_of.get(&lp.layer).copied().unwrap_or(0);
+                lp.weights = Pool::Host;
+                lp.state = Pool::Host;
+                lp.kv_resident = 0;
+                device_weights -= lb.dense;
+                device_state -= state;
+            } else {
+                device_weights += slots as u64 * per_expert;
+                lp.expert_cache_slots = slots;
+                pinned.extend(lb.expert_wids.iter().copied());
+            }
         }
-        i += 1;
     }
     Ok(Plan { layers: plan, pinned, weights_bytes: device_weights, state_bytes: device_state, n_ctx, n_batch, n_seq })
 }
@@ -438,7 +455,7 @@ impl PlanDoc {
         if let Some(p) = pools.get_mut(&main.id()) {
             p.free = free;
             p.total = total;
-            p.capacity = (free as f64 * POOL_FILL) as u64;
+            p.capacity = pool_budget(loaded, plan.n_batch, free);
             p.compute_reserve = free.saturating_sub(p.capacity);
         }
         Self { n_ctx: plan.n_ctx, n_batch: plan.n_batch, n_seq: plan.n_seq, pools: pools.into_values().collect(), placements: place.into_values().collect(), expert_slots: slots, kv_resident: resident }

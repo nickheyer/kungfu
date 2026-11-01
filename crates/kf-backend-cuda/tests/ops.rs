@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use kf_backend_cpu::CpuBackend;
-use kf_core::{Act, GraphBuilder, Op, RopeKind, RopeParams, Tid, Wid, Yarn};
+use kf_core::{Act, Backend, GraphBuilder, Op, RopeKind, RopeParams, Tid, Wid, Yarn};
 
 struct Setup {
     w: Mem,
@@ -13,6 +13,9 @@ struct Setup {
 }
 
 const N: usize = 96;
+
+/// Columns of the table's rows, the width every hidden row of these graphs has
+const N_EMBD_TABLE: usize = N;
 
 fn setup(seed: u64) -> Setup {
     let mut rng = Rng(seed);
@@ -248,4 +251,148 @@ fn broadcasts_and_unary() {
         let y = g.push(Op::Embed { weight: other }, &[tokens]);
         g.push(Op::GatedAct { act: Act::GeluErf, limit: None }, &[x, y])
     });
+}
+
+/// The top k of wide rows with ties, masked columns, and rows narrower than a block agree with the reference exactly
+#[test]
+fn topk_rows_exact() {
+    let mut s = setup(9);
+    let check = |s: &mut Setup, what: &str, rows: Vec<Vec<f32>>, k: usize| {
+        let cols = rows[0].len();
+        let n = rows.len();
+        let mut g = GraphBuilder::new();
+        let h = g.input("hidden");
+        let y = g.push(Op::TopK { k }, &[h]);
+        let graph = g.finish(y);
+        let inp = kf_core::Inputs { tokens: vec![0; n], positions: (0..n as u32).collect(), hidden: rows.concat(), hidden_cols: cols, ..Default::default() };
+        let want = s.cpu.run(&graph, &inp, &s.w).unwrap_or_else(|e| panic!("{what} cpu: {e:#}"));
+        let got = s.gpu.run(&graph, &inp, &s.w).unwrap_or_else(|e| panic!("{what} cuda: {e:#}"));
+        assert_eq!(got.len(), n * (2 * k + 1), "{what} output size");
+        for r in 0..n {
+            let (w, g) = (&want[r * (2 * k + 1)..(r + 1) * (2 * k + 1)], &got[r * (2 * k + 1)..(r + 1) * (2 * k + 1)]);
+            assert_eq!(&g[..2 * k], &w[..2 * k], "{what} row {r} ids and values");
+            let (lw, lg) = (w[2 * k], g[2 * k]);
+            assert!((lw - lg).abs() <= 1e-4 * lw.abs().max(1.0), "{what} row {r} log sum exp {lg} against {lw}");
+        }
+        for r in 0..n {
+            let row = &rows[r];
+            let g = &got[r * (2 * k + 1)..(r + 1) * (2 * k + 1)];
+            for i in 0..k {
+                assert_eq!(g[k + i], row[g[i] as usize], "{what} row {r} candidate {i} value is the row's");
+                if i > 0 {
+                    let (a, b) = (g[i - 1] as usize, g[i] as usize);
+                    assert!(row[a] > row[b] || (row[a] == row[b] && a < b), "{what} row {r} candidates {i} ordered");
+                }
+            }
+        }
+    };
+    let v = 128256;
+    let wide: Vec<f32> = (0..v).map(|i| ((i as u32).wrapping_mul(2654435761) >> 9) as f32 / (1u32 << 23) as f32 * 30.0 - 15.0).collect();
+    let tied: Vec<f32> = (0..v).map(|i| (i % 7) as f32).collect();
+    let mut masked = wide.clone();
+    masked[1000..100000].iter_mut().for_each(|x| *x = f32::NEG_INFINITY);
+    let mut peak = tied.clone();
+    peak[77777] = 1e9;
+    check(&mut s, "wide rows", vec![wide.clone(), tied.clone(), masked.clone(), peak], 64);
+    check(&mut s, "many candidates", vec![wide.clone(), tied.clone()], 128);
+    check(&mut s, "narrow row", vec![wide[..100].to_vec(), tied[..100].to_vec()], 64);
+    check(&mut s, "whole row", vec![wide[..5].to_vec()], 5);
+    check(&mut s, "one candidate", vec![masked[..3000].to_vec()], 1);
+    let mut rng = Rng(5);
+    let noisy: Vec<Vec<f32>> = (0..6).map(|_| rng.vec(v, 8.0)).collect();
+    check(&mut s, "noisy rows", noisy, 64);
+}
+
+/// Many rows shaped like a head's logits, every id inside the vocabulary and every row equal to the reference
+#[test]
+fn topk_many_logit_rows() {
+    let mut s = setup(21);
+    let v = 128256;
+    let mut rng = Rng(0x7a7a);
+    for round in 0..12 {
+        let rows = [1usize, 8, 16, 32, 64][round % 5];
+        let logits: Vec<f32> = (0..rows * v)
+            .map(|_| {
+                let g: f32 = (0..4).map(|_| rng.unit()).sum::<f32>() - 2.0;
+                g * 5.0 + if rng.unit() < 0.003 { 12.0 + rng.unit() * 10.0 } else { 0.0 }
+            })
+            .collect();
+        let mut g = GraphBuilder::new();
+        let h = g.input("hidden");
+        let y = g.push(Op::TopK { k: 64 }, &[h]);
+        let graph = g.finish(y);
+        let inp = kf_core::Inputs { tokens: vec![0; rows], positions: (0..rows as u32).collect(), hidden: logits.clone(), hidden_cols: v, ..Default::default() };
+        let want = s.cpu.run(&graph, &inp, &s.w).expect("cpu");
+        let got = s.gpu.run(&graph, &inp, &s.w).expect("cuda");
+        for r in 0..rows {
+            let (w, g) = (&want[r * 129..(r + 1) * 129], &got[r * 129..(r + 1) * 129]);
+            for i in 0..64 {
+                assert!((g[i] as usize) < v, "round {round} row {r} candidate {i} id {} past the vocabulary", g[i]);
+            }
+            assert_eq!(&g[..128], &w[..128], "round {round} row {r}");
+        }
+    }
+}
+
+/// The hidden rows a graph marks survive the pass on both backends and equal a graph that outputs them
+#[test]
+fn kept_hidden_rows_survive_the_pass() {
+    let mut s = setup(33);
+    let toks = &TOKS[..];
+    let build = |keep: bool| {
+        let mut g = GraphBuilder::new();
+        let tokens = g.input("tokens");
+        let x = g.push(Op::Embed { weight: s.table }, &[tokens]);
+        let y = g.push(Op::RmsNorm { weight: None, bias: None, eps: 1e-5 }, &[x]);
+        let z = g.push(Op::Scale(2.0), &[y]);
+        let w = g.push(Op::Add, &[z, y]);
+        if keep {
+            g.keep_hidden(x);
+            g.finish(w)
+        } else {
+            g.finish(x)
+        }
+    };
+    let plain = build(false);
+    let kept = build(true);
+    let inp = inputs(toks, 3);
+    let want = s.cpu.run(&plain, &inp, &s.w).expect("cpu plain");
+    s.cpu.run(&kept, &inp, &s.w).expect("cpu kept");
+    s.gpu.run(&kept, &inp, &s.w).expect("cuda kept");
+    assert_close("hidden rows cpu", &s.cpu.hidden_rows().expect("cpu hidden"), &want, 1e-5);
+    assert_close("hidden rows cuda", &s.gpu.hidden_rows().expect("cuda hidden"), &want, 1e-5);
+}
+
+/// The ring pairs rows of one slot at neighbouring positions and never across a rollback, each holding the pass's hidden row
+#[test]
+fn feature_ring_pairs_rows_within_an_epoch() {
+    let mut s = setup(44);
+    s.gpu.start_ring(N_EMBD_TABLE).expect("ring");
+    let mut g = GraphBuilder::new();
+    let tokens = g.input("tokens");
+    let x = g.push(Op::Embed { weight: s.table }, &[tokens]);
+    let y = g.push(Op::RmsNorm { weight: None, bias: None, eps: 1e-5 }, &[x]);
+    g.keep_hidden(x);
+    let graph = g.finish(y);
+    let mut hidden = Vec::new();
+    for (toks, start) in [(&TOKS[..4], 0u32), (&TOKS[4..5], 4), (&TOKS[1..3], 5)] {
+        s.gpu.run(&graph, &inputs(toks, start), &s.w).expect("cuda");
+        hidden.push(s.gpu.hidden_rows().expect("hidden"));
+    }
+    s.gpu.truncate(0, 3).expect("truncate");
+    s.gpu.run(&graph, &inputs(&TOKS[2..5], 3), &s.w).expect("cuda");
+    hidden.push(s.gpu.hidden_rows().expect("hidden"));
+    let ring = s.gpu.ring.as_ref().expect("ring");
+    assert_eq!(ring.count, 10);
+    let mut pairs = ring.pairs();
+    pairs.sort_unstable();
+    // Rows 0 to 6 ran positions 0 to 6 before the rollback, rows 7 to 9 positions 3 to 5 after it
+    assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 8), (8, 9)]);
+    assert_eq!((ring.entry(4).pos, ring.entry(4).token, ring.entry(7).pos, ring.entry(7).epoch), (4, TOKS[4], 3, 1));
+    let rows = kf_backend_cuda::features::ring_rows(&mut s.gpu, &[0, 4, 7, 9]).expect("rows");
+    let cols = N_EMBD_TABLE;
+    assert_eq!((rows.len(), hidden[0].len(), hidden[1].len(), hidden[3].len()), (4 * cols, 4 * cols, cols, 3 * cols));
+    for (k, want) in [&hidden[0][..cols], &hidden[1][..cols], &hidden[3][..cols], &hidden[3][2 * cols..3 * cols]].iter().enumerate() {
+        assert_eq!(&rows[k * cols..(k + 1) * cols], *want, "gathered ring row {k}");
+    }
 }

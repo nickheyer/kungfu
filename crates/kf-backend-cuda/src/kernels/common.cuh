@@ -97,3 +97,182 @@ __device__ __forceinline__ float kf_act(float x, int act) {
     if (act == 4) { float r = fmaxf(x, 0.0f); return r * r; }
     return fmaxf(x, 0.0f);
 }
+
+// Position stream of rotary pair i under the section rules of a rope kind, mode 0 one stream, 1 mrope, 2 imrope, 3 vision
+__device__ __forceinline__ int kf_rope_stream(int i, int mode, int s0, int s1, int s2, int sect) {
+    if (mode == 0) return 0;
+    if (mode == 3) return i < s0 ? 0 : 1;
+    int sector = i % sect;
+    if (mode == 1) return sector < s0 ? 0 : (sector < s0 + s1 ? 1 : (sector < s0 + s1 + s2 ? 2 : 3));
+    int t = sector % 3;
+    if (t == 1 && sector < 3 * s1) return 1;
+    if (t == 2 && sector < 3 * s2) return 2;
+    if (t == 0 && sector < 3 * s0) return 0;
+    return 3;
+}
+
+__device__ __forceinline__ u32 kf_smem_addr(const void* p) {
+    return (u32)__cvta_generic_to_shared(p);
+}
+
+// Sixteen byte asynchronous copy into shared memory, zero filled when fill is false
+__device__ __forceinline__ void kf_cp_async16(u32 dst, const void* src, bool fill) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    int n = fill ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(n));
+#endif
+}
+
+__device__ __forceinline__ void kf_cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void kf_cp_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+#endif
+}
+
+__device__ __forceinline__ void kf_ldmatrix_x4(u32& r0, u32& r1, u32& r2, u32& r3, u32 addr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+#endif
+}
+
+__device__ __forceinline__ void kf_ldmatrix_x4_trans(u32& r0, u32& r1, u32& r2, u32& r3, u32 addr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+#endif
+}
+
+// c += a * b for one m16 n8 k16 half precision product with single precision accumulation
+__device__ __forceinline__ void kf_mma_f16(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
+// Two singles rounded to halves and packed low then high
+__device__ __forceinline__ u32 kf_pack_half2(float lo, float hi) {
+    return (u32)kf_f2h(lo) | ((u32)kf_f2h(hi) << 16);
+}
+
+// Four byte asynchronous copy into shared memory, zero filled when fill is false
+__device__ __forceinline__ void kf_cp4(u32 dst, const void* src, bool fill) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    int n = fill ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(n));
+#endif
+}
+
+__device__ __forceinline__ void kf_load8(const float* p, float* v) {
+    float4 a = *reinterpret_cast<const float4*>(p);
+    float4 b = *reinterpret_cast<const float4*>(p + 4);
+    v[0] = a.x;
+    v[1] = a.y;
+    v[2] = a.z;
+    v[3] = a.w;
+    v[4] = b.x;
+    v[5] = b.y;
+    v[6] = b.z;
+    v[7] = b.w;
+}
+
+// One row of the int8 activation scratch, the integers then scales and integer sums per 16 and per 32 columns
+struct KfActRow {
+    i8* q;
+    float* s16;
+    float* m16;
+    float* s32;
+    float* m32;
+};
+
+__device__ __forceinline__ KfActRow kf_act_row(i8* q, float* s16, float* m16, float* s32, float* m32, int row, int n) {
+    KfActRow r;
+    r.q = q + (i64)row * n;
+    r.s16 = s16 + (i64)row * (n >> 4);
+    r.m16 = m16 + (i64)row * (n >> 4);
+    r.s32 = s32 + (i64)row * (n >> 5);
+    r.m32 = m32 + (i64)row * (n >> 5);
+    return r;
+}
+
+// Columns one block of the quantizing kernels covers, eight warps of 256
+#define KF_QUANT_SPAN 2048
+
+// Quantizes the eight columns of every lane in a 256 wide span starting at column c0 - lane * 8, writing the int8
+// values and the block scale and integer sum of each 16 and each 32 wide group as floats
+__device__ __forceinline__ void kf_quant_span(const float* v, int c0, int n, int kind, const KfActRow& o) {
+    const int lane = threadIdx.x & 31;
+    const bool in = c0 < n;
+    float d = 0.0f;
+    int qi[8];
+    if (kind == 3) {
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(v[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        float dd = amax / 127.0f;
+        float id = dd != 0.0f ? 1.0f / dd : 0.0f;
+        d = kf_round_f16(dd);
+#pragma unroll
+        for (int j = 0; j < 8; j++) qi[j] = (int)roundf(v[j] * id);
+    } else {
+        float a = -1.0f, mx = 0.0f;
+        int idx = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float aj = in ? fabsf(v[j]) : -1.0f;
+            if (aj > a) {
+                a = aj;
+                idx = c0 + j;
+                mx = v[j];
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            float oa = __shfl_xor_sync(0xffffffffu, a, o);
+            int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+            float om = __shfl_xor_sync(0xffffffffu, mx, o);
+            if (oa > a || (oa == a && oi < idx)) {
+                a = oa;
+                idx = oi;
+                mx = om;
+            }
+        }
+        if (a > 0.0f) {
+            float iscale = -127.0f / mx;
+            d = 1.0f / iscale;
+#pragma unroll
+            for (int j = 0; j < 8; j++) qi[j] = (int)fminf(rintf(iscale * v[j]), 127.0f);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; j++) qi[j] = 0;
+        }
+    }
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 8; j++) sum += qi[j];
+    // Two lanes make a group of 16, four a group of 32
+    const int sum16 = sum + __shfl_xor_sync(0xffffffffu, sum, 1);
+    const int sum32 = sum16 + __shfl_xor_sync(0xffffffffu, sum16, 2);
+    if (in) {
+        u32 lo = (u32)(qi[0] & 0xff) | ((u32)(qi[1] & 0xff) << 8) | ((u32)(qi[2] & 0xff) << 16) | ((u32)(qi[3] & 0xff) << 24);
+        u32 hi = (u32)(qi[4] & 0xff) | ((u32)(qi[5] & 0xff) << 8) | ((u32)(qi[6] & 0xff) << 16) | ((u32)(qi[7] & 0xff) << 24);
+        *reinterpret_cast<uint2*>(o.q + c0) = make_uint2(lo, hi);
+        if ((lane & 1) == 0) {
+            o.s16[c0 >> 4] = d;
+            o.m16[c0 >> 4] = (float)sum16;
+        }
+        if ((lane & 3) == 0) {
+            o.s32[c0 >> 5] = d;
+            o.m32[c0 >> 5] = (float)sum32;
+        }
+    }
+}
+

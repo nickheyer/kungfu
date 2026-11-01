@@ -1,5 +1,5 @@
 use crate::{Buf, CpuBackend};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use kf_core::{Act, GluLimit, Inputs, Op, WeightSource, Wid};
 use rayon::prelude::*;
 
@@ -162,6 +162,36 @@ pub fn softmax_rows(x: &Buf) -> Buf {
         softmax_inplace(out.row_mut(r));
     }
     out
+}
+
+/// The k largest values of every row with their ids, largest first and lower id first among equals, then the row's log sum exp
+pub fn topk_rows(x: &Buf, k: usize) -> Result<Buf> {
+    ensure!(k >= 1 && k <= x.cols, "top {k} of {} columns", x.cols);
+    let mut out = Buf::new(x.rows, 2 * k + 1);
+    for r in 0..x.rows {
+        let row = x.row(r);
+        let rank = |a: &u32, b: &u32| row[*b as usize].total_cmp(&row[*a as usize]).then(a.cmp(b));
+        let mut idx: Vec<u32> = (0..row.len() as u32).collect();
+        if k < row.len() {
+            idx.select_nth_unstable_by(k - 1, rank);
+            idx.truncate(k);
+        }
+        idx.sort_unstable_by(rank);
+        let o = out.row_mut(r);
+        for (i, id) in idx.iter().enumerate() {
+            o[i] = *id as f32;
+            o[k + i] = row[*id as usize];
+        }
+        o[2 * k] = log_sum_exp(row);
+    }
+    Ok(out)
+}
+
+/// Log of the sum of the exponentials of a row, the largest value factored out
+pub fn log_sum_exp(v: &[f32]) -> f32 {
+    let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let s: f64 = v.iter().map(|x| f64::from(*x - m).exp()).sum();
+    m + s.ln() as f32
 }
 
 pub fn softmax_inplace(v: &mut [f32]) {
@@ -514,6 +544,10 @@ pub fn exec(b: &mut CpuBackend, op: &Op, ins: &[Buf], _inputs: &Inputs, weights:
         Op::Softmax => {
             need(1)?;
             Ok(softmax_rows(&ins[0]))
+        }
+        Op::TopK { k } => {
+            need(1)?;
+            topk_rows(&ins[0], *k)
         }
         Op::Softcap(c) => {
             need(1)?;

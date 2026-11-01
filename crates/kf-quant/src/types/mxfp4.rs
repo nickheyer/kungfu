@@ -1,5 +1,5 @@
 use crate::types::grids::KVALUES_FP4;
-use crate::{Quant, TypeInfo};
+use crate::{ActI8, Quant, TypeInfo};
 
 pub static INFO: TypeInfo = TypeInfo { id: 39, name: "mxfp4", block: 32, size: 17 };
 pub struct Mxfp4;
@@ -8,6 +8,35 @@ pub struct Mxfp4;
 fn e8m0_to_fp32_half(x: u8) -> f32 {
     let bits = if x < 2 { 0x0020_0000u32 << x } else { ((x - 1) as u32) << 23 };
     f32::from_bits(bits)
+}
+
+/// Rows r0 on of the activations against one row, nibbles mapped through the fp4 table once for every row
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2<const R: usize>(src: &[u8], x: &ActI8, r0: usize, y: &mut [f32]) {
+    use crate::simd::hsum_ps;
+    use std::arch::x86_64::*;
+    let (n, n16) = (x.n, x.n / 16);
+    let kv = unsafe { _mm_loadu_si128(KVALUES_FP4.as_ptr() as *const __m128i) };
+    let m4 = _mm_set1_epi8(0xf);
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for (b, blk) in src.chunks_exact(17).enumerate() {
+        let dw = e8m0_to_fp32_half(blk[0]);
+        let q = unsafe { _mm_loadu_si128(blk.as_ptr().add(1) as *const __m128i) };
+        let lo = _mm_shuffle_epi8(kv, _mm_and_si128(q, m4));
+        let hi = _mm_shuffle_epi8(kv, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+        let w = _mm256_set_m128i(hi, lo);
+        let wabs = _mm256_sign_epi8(w, w);
+        for r in 0..R {
+            let q8 = unsafe { _mm256_loadu_si256(x.q.as_ptr().add((r0 + r) * n + b * 32) as *const __m256i) };
+            let dot = _mm256_madd_epi16(_mm256_maddubs_epi16(wabs, _mm256_sign_epi8(q8, w)), ones);
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(dw * x.d[(r0 + r) * n16 + b * 2]), _mm256_cvtepi32_ps(dot), acc[r]);
+        }
+    }
+    for r in 0..R {
+        y[r0 + r] = hsum_ps(acc[r]);
+    }
 }
 
 impl Quant for Mxfp4 {
@@ -24,5 +53,12 @@ impl Quant for Mxfp4 {
                 *y1 = KVALUES_FP4[(q >> 4) as usize] as f32 * d;
             }
         }
+    }
+    fn dot_i8(&self, src: &[u8], x: &ActI8, y: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::simd::have() {
+            return crate::simd::avx2_rows!(dot_avx2, src, x, y);
+        }
+        crate::dot_i8_generic(self, src, x, y)
     }
 }

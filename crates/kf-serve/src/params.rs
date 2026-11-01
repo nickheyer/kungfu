@@ -76,8 +76,12 @@ pub static PARAMS: &[Param] = &[
     Param { advanced: true, repeated: true, ..p("admit", Kind::String, "", "Formation", "--admit", "Admit", "address a stage admits on its port, once per address, every other address refused") },
     Param { advanced: true, ..p("slot_dir", Kind::Path, "", "Formation", "--slot-dir", "Slot directory", "where a prefill or decode seat saves and restores the sequence files the slots API names") },
     Param { picks: "draft", advanced: true, ..p("draft_model", Kind::Path, "", "Speculative decoding", "--draft-model", "Draft model", "a smaller model of the same vocabulary the draft seat proposes tokens from") },
-    Param { unit: "tokens", min: 1.0, max: 64.0, step: 1.0, advanced: true, ..p("draft_max", Kind::Int, "3", "Speculative decoding", "--draft-max", "Draft tokens per round", "tokens a draft seat proposes per round") },
+    Param { unit: "tokens", min: 1.0, max: 64.0, step: 1.0, advanced: true, ..p("draft_max", Kind::Int, "4", "Speculative decoding", "--draft-max", "Draft tokens per round", "tokens a draft seat or the ngram drafter proposes per round") },
+    Param { choices: SPECULATE, advanced: true, ..p("speculate", Kind::String, "auto", "Speculative decoding", "--speculate", "Speculation", "head drafts a tree from the head the server teaches itself on the rows it scores, the context's repeats grafted in, and measures it against the ngram drafter round by round, ngram drafts from the context's repeats alone, auto is head on a device and ngram on the cpu, off decodes one token per pass") },
+    Param { unit: "rows", min: 2.0, max: 64.0, step: 1.0, advanced: true, ..p("head_rows", Kind::Int, "16", "Speculative decoding", "--head-rows", "Head tree rows", "rows of the tree the learned head drafts for one verify pass") },
 ];
+
+pub const SPECULATE: &[&str] = &["auto", "head", "ngram", "off"];
 
 pub const ROLES: &[&str] = &["head", "replica", "stage", "prefill", "decode", "draft"];
 
@@ -215,6 +219,8 @@ pub struct Seat {
     pub slot_dir: Option<PathBuf>,
     pub draft_model: Option<PathBuf>,
     pub draft_max: usize,
+    pub speculate: String,
+    pub head_rows: usize,
 }
 
 /// Everything a launch needs, typed from the table's values
@@ -272,6 +278,8 @@ impl Launch {
             slot_dir: v("slot_dir").path("slot_dir"),
             draft_model: v("draft_model").path("draft_model"),
             draft_max: v("draft_max").int("draft_max")? as usize,
+            speculate: v("speculate").str("speculate").to_string(),
+            head_rows: v("head_rows").int("head_rows")? as usize,
         };
         let launch = Self {
             model,

@@ -73,7 +73,7 @@ fn graph(m: &Moe) -> kf_core::Graph {
 }
 
 fn plan(slots: usize, pinned: Vec<Wid>) -> Plan {
-    Plan { layers: vec![LayerPlan { layer: 0, weights: Pool::Device(0), state: Pool::Device(0), expert_cache_slots: slots, kv_resident: 0 }], pinned, weights_bytes: 0, state_bytes: 0, n_ctx: 64, n_batch: 16, n_seq: 1 }
+    Plan { layers: vec![LayerPlan { layer: 0, weights: Pool::Device(0), state: Pool::Device(0), expert_cache_slots: slots, kv_resident: 0 }], pinned, weights_bytes: 0, state_bytes: 0, n_ctx: 128, n_batch: 64, n_seq: 1 }
 }
 
 fn check(name: &str, ty: u32, tol: f32) {
@@ -88,12 +88,13 @@ fn check_with(name: &str, ty: u32, tol: f32, n_expert: usize, n_used: usize) {
     let mut cpu = CpuBackend::new();
     let mut gpu = cuda();
     gpu.apply_plan(&plan(0, Vec::new())).expect("resident plan");
-    for toks in [&[3u32][..], &[3, 17, 0, 31, 9, 12, 1]] {
+    let many: Vec<u32> = (0..37u32).map(|i| (i * 7 + 3) % 32).collect();
+    for toks in [&[3u32][..], &[3, 17, 0, 31, 9, 12, 1], &many] {
         both(&format!("{name} resident experts with {} rows", toks.len()), &g, &inputs(toks, 0), &m.w, &mut cpu, &mut gpu, tol);
     }
     let mut gpu = cuda();
     gpu.apply_plan(&plan(3, vec![m.gate, m.up, m.down])).expect("cached plan");
-    for toks in [&[3u32][..], &[3, 17, 0, 31, 9, 12, 1], &[5, 5, 2]] {
+    for toks in [&[3u32][..], &[3, 17, 0, 31, 9, 12, 1], &[5, 5, 2], &many] {
         both(&format!("{name} cached experts with {} rows", toks.len()), &g, &inputs(toks, 0), &m.w, &mut cpu, &mut gpu, tol);
     }
 }

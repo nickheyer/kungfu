@@ -5,7 +5,7 @@ use kf_backend_cuda::CudaBackend;
 use kf_core::{Backend, Graph, Inputs, WeightSource, Wid};
 use std::path::{Path, PathBuf};
 
-pub const MODELS: &str = "/tmp/claude-1000/-home-nick-code-kungfu/d8d84ac4-ebc2-4907-b8d6-c27b30a54cec/scratchpad/models";
+pub const MODELS: &str = "/home/nick/.cache/kungfu-models";
 pub const QWEN: &str = "Qwen3-0.6B-Q8_0.gguf";
 pub const LLAMA: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 
@@ -182,4 +182,34 @@ pub fn both(what: &str, g: &Graph, inp: &Inputs, w: &dyn WeightSource, cpu: &mut
     let got = gpu.run(g, inp, w).unwrap_or_else(|e| panic!("{what} cuda: {e:#}"));
     assert_close(what, &got, &want, tol);
     got
+}
+
+/// The ancestor mask of row i of a tree relative to its last row, as the session builds it
+pub fn tree_mask(parents: &[i32], i: usize) -> u64 {
+    let n = parents.len();
+    let mut mask = if n < 64 { !0u64 << n } else { 0 };
+    let mut at = i as i32;
+    while at >= 0 {
+        mask |= 1u64 << (n - 1 - at as usize);
+        at = parents[at as usize];
+    }
+    mask
+}
+
+/// Inputs of a tree pass on a slot whose history holds base rows, tokens numbered from the base
+pub fn tree_inputs(seq: usize, base: usize, tokens: &[u32], parents: &[i32]) -> Inputs {
+    let n = tokens.len();
+    let mut depth = vec![0u32; n];
+    for i in 1..n {
+        depth[i] = depth[parents[i] as usize] + 1;
+    }
+    Inputs {
+        tokens: tokens.to_vec(),
+        positions: (base..base + n).map(|p| p as u32).collect(),
+        seqs: vec![seq as u32; n],
+        rope: depth.iter().map(|d| [base as u32 + d; 4]).collect(),
+        attend: vec![(base + n - 1) as u32; n],
+        tree: (0..n).map(|i| kf_core::TreeRow { mask: tree_mask(parents, i), position: base as u32 + depth[i] }).collect(),
+        ..Default::default()
+    }
 }

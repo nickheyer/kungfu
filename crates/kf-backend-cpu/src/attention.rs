@@ -1,6 +1,6 @@
 use crate::{Buf, CpuBackend, KvLayer};
 use anyhow::{Result, anyhow, bail};
-use kf_core::{Inputs, Op, SwaType, WeightSource, Window};
+use kf_core::{Inputs, Op, SwaType, TreeRow, WeightSource, Window};
 
 /// Scoring and masking rules of one attention call
 pub struct Spec<'a> {
@@ -17,6 +17,8 @@ pub struct Spec<'a> {
     pub top_k: Option<&'a Buf>,
     /// Last key position each query row sees, its own position when empty
     pub attend: &'a [u32],
+    /// The rows of a tree pass, each seeing its ancestors among the pass's rows, empty when the rows follow one another
+    pub tree: &'a [TreeRow],
 }
 
 /// ALiBi slope of one head by the llama rule over the query head count
@@ -83,6 +85,9 @@ pub fn run(cache: &KvLayer, q: &Buf, s: &Spec) -> Result<Buf> {
     for r in 0..q.rows {
         let pos = n_before + r;
         let hi = s.attend.get(r).map_or(pos, |a| (*a as usize).min(cache.n - 1)).max(pos);
+        let tree = s.tree.get(r).copied();
+        // A tree row's window counts from its position in the sequence, its cache index standing past it
+        let wpos = tree.map_or(pos, |t| t.position as usize);
         for h in 0..s.n_head {
             let hk = h / group;
             if h == 0 || (per_group && h % group == 0) {
@@ -93,7 +98,7 @@ pub fn run(cache: &KvLayer, q: &Buf, s: &Spec) -> Result<Buf> {
                         let seg = if per_group { &row[hk * (t.cols / s.n_head_kv)..(hk + 1) * (t.cols / s.n_head_kv)] } else { row };
                         keys.extend(seg.iter().filter(|v| **v >= 0.0).map(|v| *v as usize).filter(|j| *j < cache.n));
                     }
-                    None => keys.extend((0..=hi).filter(|j| visible(pos, hi, *j, s.window))),
+                    None => keys.extend((0..=hi).filter(|j| visible(wpos.max(*j), hi, *j, s.window) && tree.is_none_or(|t| t.sees(hi as u32, *j as u32)))),
                 }
             }
             for (d, v) in qh.iter_mut().zip(&q.row(r)[h * s.head_dim..(h + 1) * s.head_dim]) {
@@ -210,6 +215,7 @@ pub fn exec(b: &mut CpuBackend, op: &Op, ins: &[Buf], inputs: &Inputs, weights: 
         alibi_bias: *alibi_bias,
         top_k: topk,
         attend: &inputs.attend,
+        tree: &inputs.tree,
     };
     match kv_source {
         Some(src) => {

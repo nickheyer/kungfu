@@ -4,7 +4,11 @@ use anyhow::{Result, bail};
 pub const HEADERS: &[(&str, &str)] = &[
     ("common.cuh", include_str!("kernels/common.cuh")),
     ("quant.cuh", include_str!("kernels/quant.cuh")),
+    ("mm_i8.cuh", include_str!("kernels/mm_i8.cuh")),
     ("grids.cuh", include_str!("kernels/grids.cuh")),
+    ("kf8.cu", include_str!("kernels/kf8.cu")),
+    ("attention_decode.cuh", include_str!("kernels/attention_decode.cuh")),
+    ("persist.cuh", include_str!("kernels/persist.cuh")),
 ];
 
 /// Op kernel modules by name
@@ -15,6 +19,11 @@ pub const MODULES: &[(&str, &str)] = &[
     ("attention", include_str!("kernels/attention.cu")),
     ("moe", include_str!("kernels/moe.cu")),
     ("sample", include_str!("kernels/sample.cu")),
+    ("kf8", include_str!("kernels/kf8.cu")),
+    ("kf8w", include_str!("kernels/kf8w.cu")),
+    ("flash", include_str!("kernels/flash.cu")),
+    ("fused", include_str!("kernels/fused.cu")),
+    ("train", include_str!("kernels/train.cu")),
 ];
 
 /// Quant kernel modules keyed by the kf-quant type name
@@ -51,14 +60,71 @@ pub const QUANT_MODULES: &[(&str, &str)] = &[
     ("q2_0", include_str!("kernels/quant_q2_0.cu")),
 ];
 
-/// Quant types whose kernel file gives q16 and so the matmul_i8 tensor core entry, every block type but the floats
-pub const INT8_TYPES: &[&str] = &[
-    "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q8_1", "q2_K", "q3_K", "q4_K", "q5_K", "q6_K", "q8_K", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl", "iq3_s", "iq2_s", "iq4_xs", "iq1_m", "tq1_0", "tq2_0", "mxfp4", "nvfp4", "q1_0", "q2_0",
+/// Quant types whose kernel file gives q16 and so the KF8 unpack, every block type but the floats, with the KF8 group size
+/// and whether the type has a nonzero offset, see docs/kf8-format.md. The group is 32 where the native scale is constant over
+/// every aligned 32 and 16 where it changes every 16.
+pub const INT8_TYPES: &[(&str, u32, bool)] = &[
+    ("q4_0", 32, false),
+    ("q4_1", 32, true),
+    ("q5_0", 32, false),
+    ("q5_1", 32, true),
+    ("q8_0", 32, false),
+    ("q8_1", 32, false),
+    ("q2_K", 16, true),
+    ("q3_K", 16, false),
+    ("q4_K", 32, true),
+    ("q5_K", 32, true),
+    ("q6_K", 16, false),
+    ("q8_K", 32, false),
+    ("iq2_xxs", 32, false),
+    ("iq2_xs", 16, false),
+    ("iq3_xxs", 32, false),
+    ("iq1_s", 32, false),
+    ("iq4_nl", 32, false),
+    ("iq3_s", 32, false),
+    ("iq2_s", 16, false),
+    ("iq4_xs", 32, false),
+    ("iq1_m", 16, false),
+    ("tq1_0", 32, false),
+    ("tq2_0", 32, false),
+    ("mxfp4", 32, false),
+    ("nvfp4", 16, false),
+    ("q1_0", 32, false),
+    ("q2_0", 32, false),
 ];
 
-/// Whether the quant module of a ggml type has the int8 tensor core product
+/// Columns one lane of the int8 matvec takes per block for a ggml type, the KfLane width of its kernel file
+pub fn matvec_cols(ggml_type: u32) -> usize {
+    match kf_quant::info(ggml_type).map(|i| i.name) {
+        Some("q4_K" | "q5_K" | "q6_K") => 64,
+        Some("q8_0") => 32,
+        _ => 16,
+    }
+}
+
+/// Columns of one run of the int8 matvec lane for a ggml type, the columns under one weight scale, KfLaneWords RUN
+pub fn matvec_run(ggml_type: u32) -> usize {
+    match kf_quant::info(ggml_type).map(|i| i.name) {
+        Some("q4_K" | "q5_K" | "q8_0") => 32,
+        _ => 16,
+    }
+}
+
+/// The KF8 form of a ggml type: group size and whether an offset array exists, none for the float types
+pub fn kf8_form(ggml_type: u32) -> Option<(u32, bool)> {
+    let name = kf_quant::info(ggml_type)?.name;
+    INT8_TYPES.iter().find(|(n, _, _)| *n == name).map(|&(_, g, m)| (g, m))
+}
+
+/// Whether a type's group scale carries more than 22 significant bits, so the product recovers each group sum by
+/// subtraction instead of the fused magic multiply, true only for the f32 scale of q8_K
+pub fn kf8_wide(ggml_type: u32) -> bool {
+    kf_quant::info(ggml_type).is_some_and(|i| i.name == "q8_K")
+}
+
+/// Whether the quant module of a ggml type has the KF8 unpack and so the int8 tensor core product
 pub fn has_int8(ggml_type: u32) -> bool {
-    kf_quant::info(ggml_type).is_some_and(|i| INT8_TYPES.contains(&i.name))
+    kf8_form(ggml_type).is_some()
 }
 
 /// Module name of the quant kernels for a ggml type id, none when no kernel file exists
