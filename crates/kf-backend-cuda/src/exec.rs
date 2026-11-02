@@ -434,6 +434,8 @@ pub(crate) struct Prepared {
     tree_ptr: u64,
     /// The residual rows before the final norm, kept through the pass
     hidden: Option<Tid>,
+    /// The residual rows after every tap layer, kept through the pass
+    taps: Vec<Tid>,
     epoch: Option<u64>,
     launches: Vec<Option<Vec<Launch>>>,
     graphs: Vec<Option<Captured>>,
@@ -471,8 +473,8 @@ impl Prepared {
             }
         }
         last[output.0 as usize] = usize::MAX;
-        if let Some(h) = g.hidden {
-            ensure!((h.0 as usize) < n_t && g.nodes.iter().any(|n| n.out == h), "hidden tensor {} is not computed by the graph", h.0);
+        for (h, what) in g.hidden.map(|h| (h, "hidden")).into_iter().chain(g.taps.iter().map(|t| (*t, "tap"))) {
+            ensure!((h.0 as usize) < n_t && g.nodes.iter().any(|n| n.out == h), "{what} tensor {} is not computed by the graph", h.0);
             last[h.0 as usize] = usize::MAX;
         }
         let place: Vec<Place> = g.nodes.iter().map(|n| place_node(b, n, weights, inputs.tokens.len())).collect();
@@ -552,6 +554,7 @@ impl Prepared {
             tree: !inputs.tree.is_empty(),
             tree_ptr: in_ptr + (32 * n_in) as u64,
             hidden: g.hidden,
+            taps: g.taps.clone(),
             _inputs: inputs_dev,
             stage_in,
             stage_out: None,
@@ -591,6 +594,7 @@ impl Prepared {
             && self.hidden_cols == inputs.hidden_cols
             && self.tree == !inputs.tree.is_empty()
             && self.hidden == g.hidden
+            && self.taps == g.taps
             && Some(self.output) == g.output
             && self.nodes.len() == g.nodes.len()
             && self.nodes.iter().zip(&g.nodes).all(|(a, b)| a.op == b.op && a.inputs == b.inputs && a.out == b.out && a.layer == b.layer)
@@ -1314,7 +1318,7 @@ fn matmul_group_launch(b: &mut CudaBackend, p: &Prepared, weights: &dyn WeightSo
             words.extend_from_slice(&[off(m.w_ptr, lead.w_ptr), off(m.y, lead.y), off(m.bias, lead.y), off(m.res, lead.y), start as i64, m.n_out as i64]);
         }
         let segs = p.segment_table(&b.stream, &words)?;
-        v.push(matvec_i8_launch(&mut b.kernels, ty, lead.w_ptr, base, 0, 0, lead.y, rows, n_in, total, rb, segs, members.len(), mm_i8_fits(ty, n_in, &bases))?);
+        v.push(matvec_i8_launch(&mut b.kernels, ty, lead.w_ptr, base, 0, 0, lead.y, rows, n_in, total, rb, segs, members.len(), multi_kind(ty, n_in, &bases))?);
         return Ok(v);
     }
     let (q, scales, sums) = crate::kf8::act_scratch(base, rows, n_in, f.g);
@@ -1872,6 +1876,68 @@ pub(crate) fn mm_i8_fits(ty: u32, n_in: usize, bases: &[usize]) -> bool {
     n_in.is_multiple_of(4 * sources::matvec_cols(ty)) && bases.iter().all(|b| b.is_multiple_of(8))
 }
 
+/// Kernel family of a product of a few rows on native bytes, the fragment product over the tile over the dp4a matvec
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Multi {
+    Matvec,
+    Tile,
+    Frag,
+}
+
+/// Whether the fragment product runs a shape: a type with a plan, whole super blocks under one activation scale, and
+/// every stacked member starting on a sixteen row group
+pub(crate) fn mm_frag_fits(ty: u32, n_in: usize, bases: &[usize]) -> bool {
+    sources::has_frag(ty) && n_in.is_multiple_of(256) && round_code(ty).is_ok_and(|c| c == 4) && bases.iter().all(|b| b.is_multiple_of(16))
+}
+
+/// The family a shape runs on, the fragment product wherever it fits
+pub(crate) fn multi_kind(ty: u32, n_in: usize, bases: &[usize]) -> Multi {
+    if mm_frag_fits(ty, n_in, bases) {
+        Multi::Frag
+    } else if mm_i8_fits(ty, n_in, bases) {
+        Multi::Tile
+    } else {
+        Multi::Matvec
+    }
+}
+
+/// Warps per sixteen row group of the fragment product out of the warps of a block, doubled while the grid is under
+/// two blocks per SM and every warp keeps a super block of its own
+fn frag_wpr(k: &KernelRegistry, n_in: usize, n_out: usize, warps: usize) -> usize {
+    let nsb = n_in / 256;
+    let mut wpr = 1;
+    while wpr < warps && wpr * 2 <= nsb && n_out.div_ceil(16 * warps / wpr) < 2 * k.sm_count() {
+        wpr *= 2;
+    }
+    wpr
+}
+
+/// The ring stages and warps per block of the fragment product of a type, the plan's unless overridden
+pub(crate) fn frag_shape(ty: u32, stages: Option<usize>, warps: Option<usize>) -> Result<(usize, usize, usize)> {
+    let (pitch, plan_stages, plan_warps) = sources::frag_plan(ty).ok_or_else(|| anyhow!("no fragment plan for ggml type {ty}"))?;
+    Ok((pitch, stages.unwrap_or(plan_stages), warps.unwrap_or(plan_warps)))
+}
+
+/// The fragment product launch out of a module holding the entries of the weight type, see matvec_i8_launch, with the
+/// ring stages and warps per block the module was compiled for when they differ from the plan's
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn frag_launch(k: &mut KernelRegistry, module: &str, ty: u32, w_ptr: u64, act: u64, bias: u64, res: u64, y: u64, rows: usize, n_in: usize, n_out: usize, rb: i64, segs: u64, nseg: usize, stages: Option<usize>, warps: Option<usize>) -> Result<Launch> {
+    let [.., xa] = crate::kf8::act_scratch_all(act, rows, n_in);
+    ensure!(rows <= MM_ROWS, "{rows} rows for the fragment product of at most {MM_ROWS}");
+    ensure!(crate::kf8::act_scratch_bytes(rows, n_in) <= 4 * rows * n_in, "the fragment array of {rows} rows of {n_in} overruns the four bytes per element of the quantizer's buffer");
+    let (pitch, stages, warps) = frag_shape(ty, stages, warps)?;
+    let wpr = frag_wpr(k, n_in, n_out, warps);
+    let (entry, r) = if rows <= 8 { ("mm_frag_8", 8) } else if rows <= 16 { ("mm_frag_16", 16) } else if rows <= 24 { ("mm_frag_24", 24) } else { ("mm_frag_32", 32) };
+    let smem = warps * stages * 16 * pitch;
+    Ok(Launch {
+        func: k.function_smem(module, entry, smem as u32)?,
+        grid: (n_out.div_ceil(16 * warps / wpr) as u32, rows.div_ceil(r) as u32, 1),
+        block: 32 * warps as u32,
+        smem: smem as u32,
+        args: vec![Arg::P(w_ptr), Arg::P(xa), Arg::P(bias), Arg::P(res), Arg::P(y), Arg::I(rows as i32), Arg::I(n_in as i32), Arg::I(n_out as i32), Arg::L(rb), Arg::P(segs), Arg::I(nseg as i32), Arg::I(wpr as i32)],
+    })
+}
+
 /// Rows up to which a product of a type and width runs as a matvec family kernel rather than the KF8 tile
 pub(crate) fn matvec_rows(ty: u32, n_in: usize, bases: &[usize]) -> usize {
     if mm_i8_fits(ty, n_in, bases) { MM_ROWS } else { MATVEC_ROWS }
@@ -1927,10 +1993,13 @@ pub(crate) const SEG_NONE: i64 = i64::MIN;
 /// the nseg stacked products of the segment table at segs when it is nonzero, whose pointers are offsets from w_ptr and y.
 /// Several rows run the tensor core product when mm says the shape fits it, see mm_i8_fits.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn matvec_i8_launch(k: &mut KernelRegistry, ty: u32, w_ptr: u64, act: u64, bias: u64, res: u64, y: u64, rows: usize, n_in: usize, n_out: usize, rb: i64, segs: u64, nseg: usize, mm: bool) -> Result<Launch> {
+pub(crate) fn matvec_i8_launch(k: &mut KernelRegistry, ty: u32, w_ptr: u64, act: u64, bias: u64, res: u64, y: u64, rows: usize, n_in: usize, n_out: usize, rb: i64, segs: u64, nseg: usize, kind: Multi) -> Result<Launch> {
     let module = sources::quant_module(ty).ok_or_else(|| anyhow!("no quant kernels for ggml type {ty}"))?;
-    let [q, s16, m16, s32, m32] = crate::kf8::act_scratch_all(act, rows, n_in);
-    if rows > 1 && mm {
+    let [q, s16, m16, s32, m32, _] = crate::kf8::act_scratch_all(act, rows, n_in);
+    if rows > 1 && kind == Multi::Frag {
+        return frag_launch(k, &module, ty, w_ptr, act, bias, res, y, rows, n_in, n_out, rb, segs, nseg, None, None);
+    }
+    if rows > 1 && kind == Multi::Tile {
         let cols = sources::matvec_cols(ty);
         let wpr = mm_wpr(k, n_in, n_out, cols);
         ensure!(rows <= MM_ROWS, "{rows} rows for the tensor core product of at most {MM_ROWS}");
@@ -1977,7 +2046,7 @@ pub(crate) fn quant_grid(rows: usize, n: usize) -> (u32, u32, u32) {
 
 /// The five scratch pointers as kernel arguments in the order the quantizers take them
 pub(crate) fn act_args(base: u64, rows: usize, n: usize) -> Vec<Arg> {
-    crate::kf8::act_scratch_all(base, rows, n).into_iter().map(Arg::P).collect()
+    crate::kf8::act_scratch_all(base, rows, n)[..5].iter().map(|&p| Arg::P(p)).collect()
 }
 
 /// The quantization launch of rows of n activations into the int8 form at base
@@ -2009,7 +2078,7 @@ pub(crate) fn matmul_launch(b: &mut CudaBackend, weights: &dyn WeightSource, w: 
             }
         };
         if rows <= matvec_rows(ty, n_in, &[]) {
-            v.push(matvec_i8_launch(k, ty, w_ptr, base, bias, res, y, rows, n_in, n_out, rb, 0, 0, mm_i8_fits(ty, n_in, &[]))?);
+            v.push(matvec_i8_launch(k, ty, w_ptr, base, bias, res, y, rows, n_in, n_out, rb, 0, 0, multi_kind(ty, n_in, &[]))?);
             return Ok(v);
         }
         let (q, scales, sums) = crate::kf8::act_scratch(base, rows, n_in, f.g);
@@ -2156,7 +2225,7 @@ fn expert_gemm_chunks(b: &mut CudaBackend, t: &ExpertT, d: &MoeDims, xq: u64, xd
 /// Expert product for every routed pair against the quantized activations of the scratch at act, a warp per output row
 #[allow(clippy::too_many_arguments)]
 fn expert_mv_i8(k: &mut KernelRegistry, t: &ExpertT, d: &MoeDims, slots: u64, act: u64, rows: usize, per_slot: bool, y: u64) -> Result<Launch> {
-    let [q, s16, m16, s32, m32] = crate::kf8::act_scratch_all(act, rows, t.n_in);
+    let [q, s16, m16, s32, m32, _] = crate::kf8::act_scratch_all(act, rows, t.n_in);
     Ok(Launch {
         func: k.quant_function(t.ty, "moe_matvec_i8")?,
         grid: (t.n_out.div_ceil(8) as u32, (d.n_used * d.rows) as u32, 1),
@@ -2169,7 +2238,7 @@ fn expert_mv_i8(k: &mut KernelRegistry, t: &ExpertT, d: &MoeDims, slots: u64, ac
 /// Gate and up products of every routed pair with the gated activation, one launch writing the hidden rows, for a
 /// gate and up of one type or one tensor holding both
 fn expert_gate_up_i8(k: &mut KernelRegistry, gate: Option<&ExpertT>, up: &ExpertT, d: &MoeDims, slots: u64, act: u64, rows: usize, h: u64, act_code: i32) -> Result<Launch> {
-    let [q, s16, m16, s32, m32] = crate::kf8::act_scratch_all(act, rows, up.n_in);
+    let [q, s16, m16, s32, m32, _] = crate::kf8::act_scratch_all(act, rows, up.n_in);
     let (gp, up_ptr, eb_g, eb_u) = match gate {
         Some(g) => (g.ptr, up.ptr, g.eb, up.eb),
         None => (up.ptr, 0, up.eb, 0),
@@ -2928,25 +2997,46 @@ fn run_prepared(b: &mut CudaBackend, p: &mut Prepared, inputs: &Inputs, weights:
         }
         None => None,
     };
-    if let Some(h) = b.hidden {
-        // The kept rows are the last ones of the pass, a tree's rows going to the ring with the path compaction keeps
-        ensure!(h.rows <= n, "{} hidden rows for a pass of {n} tokens", h.rows);
-        let first = n - h.rows;
-        if p.tree {
-            b.tree_tokens = (first..n).map(|r| (inputs.seq_of(r) as u32, inputs.tokens[r])).collect();
-        } else {
-            let rows: Vec<(u32, u32, u32)> = (first..n).map(|r| (inputs.seq_of(r) as u32, inputs.positions[r], inputs.tokens[r])).collect();
-            ring_append(b, h.ptr, &rows, h.cols)?;
-        }
-    }
+    b.taps = p
+        .taps
+        .iter()
+        .map(|t| {
+            let (r, c) = p.shape(*t)?;
+            Ok(Output { ptr: p.ptr(*t)?, rows: r, cols: c })
+        })
+        .collect::<Result<_>>()?;
+    b.cands = topk.map(|_| Output { ptr, rows, cols });
+    draft_pass(b, inputs)?;
     Ok(data)
 }
 
-/// Appends scored rows to the feature ring once a draft head has made one
-pub(crate) fn ring_append(b: &mut CudaBackend, src: u64, rows: &[(u32, u32, u32)], cols: usize) -> Result<()> {
-    let Some(ring) = b.ring.as_mut() else { return Ok(()) };
-    ensure!(ring.cols == cols, "hidden rows of {cols} for a feature ring of {}", ring.cols);
-    ring.append(&b.stream, src, rows)
+/// Hands the tap selection, while it collects, and the draft block, once started, every slot's rows of the pass
+/// just run, each row's tap rows and candidate rows
+fn draft_pass(b: &mut CudaBackend, inputs: &Inputs) -> Result<()> {
+    let n = inputs.tokens.len();
+    if let (Some(mut cal), Some(dense)) = (b.cal.take(), b.dense) {
+        let r = (|| {
+            ensure!(b.taps.len() == cal.n_layers && b.taps.iter().all(|t| t.rows == n) && dense.rows == n, "the tap selection needs every layer's rows of every pass scored, {} tap tensors for {} layers", b.taps.len(), cal.n_layers);
+            let taps: Vec<(u64, usize)> = b.taps.iter().map(|t| (t.ptr, t.cols)).collect();
+            cal.observe(b, &taps, dense.ptr, n, dense.cols)
+        })();
+        b.cal = Some(cal);
+        r?;
+    }
+    let Some(mut d) = b.draft.take() else { return Ok(()) };
+    let r = (|| {
+        let Some(c) = b.cands else { bail!("the draft block needs every pass to keep its candidate rows") };
+        ensure!(!b.taps.is_empty() && b.taps.iter().all(|t| t.rows == n) && c.rows == n, "the draft block needs every row of a pass scored with its tap rows, {} tap tensors and {} candidate rows for {n} tokens", b.taps.len(), c.rows);
+        let parents = inputs.tree_parents();
+        for (seq, range) in inputs.runs() {
+            let local: Vec<i32> = parents[range.clone()].iter().map(|p| if *p < 0 { -1 } else { *p - range.start as i32 }).collect();
+            let taps: Vec<u64> = b.taps.iter().map(|t| t.ptr + (range.start * t.cols * 4) as u64).collect();
+            d.pass(b, seq, &taps, c.ptr + (range.start * c.cols * 4) as u64, &inputs.tokens[range.clone()], &inputs.positions[range.clone()], &local, !inputs.tree.is_empty())?;
+        }
+        Ok(())
+    })();
+    b.draft = Some(d);
+    r
 }
 
 /// The residual rows before the final norm the last pass kept
@@ -2955,6 +3045,25 @@ pub(crate) fn hidden_rows(b: &mut CudaBackend) -> Result<Vec<f32>> {
     b.ctx.bind_to_thread()?;
     let mut out = vec![0.0f32; h.rows * h.cols];
     dtoh(&b.stream, &mut out, h.ptr)?;
+    Ok(out)
+}
+
+/// The residual rows after every tap layer the last pass kept, the taps of a row side by side
+pub(crate) fn tap_rows(b: &mut CudaBackend) -> Result<Vec<f32>> {
+    ensure!(!b.taps.is_empty(), "the last pass kept no tap rows");
+    b.ctx.bind_to_thread()?;
+    let n = b.taps[0].rows;
+    let width: usize = b.taps.iter().map(|t| t.cols).sum();
+    let mut out = vec![0.0f32; n * width];
+    let mut off = 0;
+    for t in &b.taps {
+        let mut buf = vec![0.0f32; t.rows * t.cols];
+        dtoh(&b.stream, &mut buf, t.ptr)?;
+        for r in 0..n {
+            out[r * width + off..r * width + off + t.cols].copy_from_slice(&buf[r * t.cols..(r + 1) * t.cols]);
+        }
+        off += t.cols;
+    }
     Ok(out)
 }
 
@@ -3040,17 +3149,10 @@ pub(crate) fn compact(b: &mut CudaBackend, seq: usize, base: usize, keep: &[usiz
     }
     b.stream.synchronize().context("compaction")?;
     kf_core::Backend::compact(&mut b.host, seq, base, keep)?;
-    // The kept path's rows join the ring in order, where their positions now run
-    if let Some(h) = b.hidden
-        && b.tree_tokens.len() == h.rows
-    {
-        let tokens = std::mem::take(&mut b.tree_tokens);
-        for (i, k) in keep.iter().enumerate() {
-            ensure!(*k < h.rows, "kept row {k} of a tree pass of {} rows", h.rows);
-            let (s, token) = tokens[*k];
-            ensure!(s as usize == seq, "kept row {k} belongs to slot {s}, not {seq}");
-            ring_append(b, h.ptr + (*k * h.cols * 4) as u64, &[(seq as u32, (base + i) as u32, token)], h.cols)?;
-        }
+    // The kept path's rows move onto the model's own path in the draft block's ring, where their positions now run
+    if let Some(mut d) = b.draft.take() {
+        d.compacted(seq, base, keep);
+        b.draft = Some(d);
     }
     truncate(b, Some(seq), base + keep.len())
 }

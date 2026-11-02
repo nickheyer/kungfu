@@ -65,6 +65,9 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 512)]
         max_tokens: usize,
+        /// Layers whose residual rows are written as features, comma separated, two spread through the model when empty
+        #[arg(long, default_value = "")]
+        taps: String,
         /// Sequences generated at once
         #[arg(long, default_value_t = 8)]
         slots: usize,
@@ -193,7 +196,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Bench { model, pp, tg, reps, backend, device, ctx, batch, profile, verify } => bench(&model, pp, tg, reps, &backend, device, &ctx, batch, profile.as_deref(), &verify),
-        Cmd::DrafterData { model, prompts, out, max_tokens, slots, backend, device, ctx } => drafter_data(&model, &prompts, &out, max_tokens, slots, &backend, device, &ctx),
+        Cmd::DrafterData { model, prompts, out, max_tokens, taps, slots, backend, device, ctx } => drafter_data(&model, &prompts, &out, max_tokens, &taps, slots, &backend, device, &ctx),
         Cmd::Generate { model, prompt, ids, emit_ids, max_tokens, ignore_eos, backend, device, temperature, ctx, batch, profile } => generate(&model, &prompt, ids.as_deref(), emit_ids, max_tokens, ignore_eos, &backend, device, temperature, &ctx, batch, profile.as_deref()),
     }
 }
@@ -382,10 +385,13 @@ struct Answering {
 /// state of every token as halves, index.jsonl with each sequence's offset and prompt length, the embedding, head, and
 /// final norm tables, and meta.json
 #[allow(clippy::too_many_arguments)]
-fn drafter_data(model: &PathBuf, prompts: &Path, out: &Path, max_tokens: usize, slots: usize, backend: &str, device: usize, ctx: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn drafter_data(model: &PathBuf, prompts: &Path, out: &Path, max_tokens: usize, taps: &str, slots: usize, backend: &str, device: usize, ctx: &str) -> Result<()> {
     use std::io::Write;
     ensure_slots(slots)?;
     let loaded = kf_engine::load(model)?;
+    let taps: Vec<usize> = if taps.trim().is_empty() { loaded.model.even_taps(2) } else { taps.split(',').map(|t| t.trim().parse::<usize>().map_err(|_| anyhow!("--taps takes layer numbers, not {t:?}"))).collect::<Result<_>>()? };
+    ensure!(taps.windows(2).all(|w| w[0] < w[1]) && taps.iter().all(|l| *l < loaded.model.n_layers()), "--taps {taps:?} of a model of {} layers in rising order", loaded.model.n_layers());
     let tok = kf_serve::Tok::from_gguf(&loaded.store.gguf.meta)?;
     let source = loaded.store.gguf.meta.str("tokenizer.chat_template").ok_or_else(|| anyhow!("the file carries no chat template"))?;
     let template = kf_serve::template::ChatTemplate::new(source)?;
@@ -408,12 +414,14 @@ fn drafter_data(model: &PathBuf, prompts: &Path, out: &Path, max_tokens: usize, 
     for (i, w) in norm.iter().enumerate() {
         std::fs::write(out.join(format!("norm{i}.bin")), kf_backend_cpu::dequant_all(*w, store)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
     }
-    let meta = serde_json::json!({ "n_embd": n_embd, "n_vocab": loaded.hparams.n_vocab, "rms_eps": loaded.hparams.rms_eps, "eos": tok.eos, "head_tied": head == embd, "norm_tables": norm.len(), "name": store.gguf.meta.str("general.name") });
+    let meta = serde_json::json!({ "n_embd": n_embd, "n_vocab": loaded.hparams.n_vocab, "rms_eps": loaded.hparams.rms_eps, "eos": tok.eos, "head_tied": head == embd, "norm_tables": norm.len(), "name": store.gguf.meta.str("general.name"), "taps": taps, "cands": DRAFT_CANDS });
     std::fs::write(out.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
     let text = std::fs::read_to_string(prompts)?;
     let mut queue = text.lines().filter(|l| !l.trim().is_empty());
     let mut tokens_out = std::io::BufWriter::new(std::fs::File::create(out.join("tokens.bin"))?);
     let mut features_out = std::io::BufWriter::new(std::fs::File::create(out.join("features.bin"))?);
+    let mut tap_outs: Vec<std::io::BufWriter<std::fs::File>> = taps.iter().map(|l| Ok(std::io::BufWriter::new(std::fs::File::create(out.join(format!("features_tap{l}.bin")))?))).collect::<Result<_>>()?;
+    let mut cands_out = std::io::BufWriter::new(std::fs::File::create(out.join("cands.bin"))?);
     let mut index_out = std::io::BufWriter::new(std::fs::File::create(out.join("index.jsonl"))?);
     let feat_slot = slots;
     let mut graphs: BTreeMap<usize, std::sync::Arc<kf_core::Graph>> = BTreeMap::new();
@@ -456,7 +464,8 @@ fn drafter_data(model: &PathBuf, prompts: &Path, out: &Path, max_tokens: usize, 
             if !a.done {
                 continue;
             }
-            // The whole sequence teacher forced through the blocks on the spare slot, its final hidden rows written
+            // The whole sequence teacher forced through the model on the spare slot, every row's final and mid
+            // residual rows and its top candidates written
             let mut at = 0;
             while at < a.ids.len() {
                 let n = (a.ids.len() - at).min(512);
@@ -464,20 +473,36 @@ fn drafter_data(model: &PathBuf, prompts: &Path, out: &Path, max_tokens: usize, 
                     Some(g) => g.clone(),
                     None => {
                         let mut g = kf_core::GraphBuilder::new();
-                        let x = loaded.model.segment(&mut g, n, kf_layers::Segment { from: 0, to: n_layers, embed: true, inject: false, n_out: None })?;
-                        let g = std::sync::Arc::new(g.finish(x));
+                        let l = loaded.model.segment(&mut g, n, kf_layers::Segment { from: 0, to: n_layers, embed: true, inject: false, n_out: Some(n) }, &taps)?;
+                        let top = g.push(kf_core::Op::TopK { k: DRAFT_CANDS }, &[l]);
+                        let g = std::sync::Arc::new(g.finish(top));
                         graphs.insert(n, g.clone());
                         g
                     }
                 };
                 let inputs = kf_core::Inputs { tokens: a.ids[at..at + n].to_vec(), positions: (at..at + n).map(|p| p as u32).collect(), seqs: vec![feat_slot as u32; n], ..Default::default() };
-                let hidden = session.backend_mut().run(&graph, &inputs, store)?;
-                ensure!(hidden.len() == n * n_embd, "{} hidden values for {n} rows of {n_embd}", hidden.len());
-                let mut bytes = Vec::with_capacity(hidden.len() * 2);
-                for v in &hidden {
-                    bytes.extend_from_slice(&half::f16::from_f32(*v).to_bits().to_le_bytes());
+                let packed = session.backend_mut().run(&graph, &inputs, store)?;
+                let width = 2 * DRAFT_CANDS + 1;
+                ensure!(packed.len() == n * width, "{} candidate values for {n} rows of {width}", packed.len());
+                let hidden = session.backend_mut().hidden_rows()?;
+                let tap_rows = session.backend_mut().tap_rows()?;
+                let width = taps.len() * n_embd;
+                ensure!(hidden.len() == n * n_embd && tap_rows.len() == n * width, "{} hidden and {} tap values for {n} rows of {n_embd} over {} taps", hidden.len(), tap_rows.len(), taps.len());
+                let f16s = |vals: &mut dyn Iterator<Item = f32>| -> Vec<u8> { vals.flat_map(|v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect() };
+                features_out.write_all(&f16s(&mut hidden.iter().copied()))?;
+                for (l, out) in tap_outs.iter_mut().enumerate() {
+                    out.write_all(&f16s(&mut (0..n).flat_map(|r| tap_rows[r * width + l * n_embd..r * width + (l + 1) * n_embd].iter().copied())))?;
                 }
-                features_out.write_all(&bytes)?;
+                let mut bytes = Vec::with_capacity(n * width * 4);
+                for row in packed.chunks_exact(width) {
+                    for id in &row[..DRAFT_CANDS] {
+                        bytes.extend_from_slice(&(*id as u32).to_le_bytes());
+                    }
+                    for v in &row[DRAFT_CANDS..] {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                cands_out.write_all(&bytes)?;
                 at += n;
             }
             session.backend_mut().reset_seq(feat_slot);
@@ -495,10 +520,17 @@ fn drafter_data(model: &PathBuf, prompts: &Path, out: &Path, max_tokens: usize, 
     }
     tokens_out.flush()?;
     features_out.flush()?;
+    for out in tap_outs.iter_mut() {
+        out.flush()?;
+    }
+    cands_out.flush()?;
     index_out.flush()?;
     println!("{sequences} sequences, {written} tokens, {skipped} prompts skipped as too long, {:.1} s", t0.elapsed().as_secs_f64());
     Ok(())
 }
+
+/// Candidates the data command keeps per row, the model's most likely next tokens with their logits
+const DRAFT_CANDS: usize = 64;
 
 /// At least one generation slot and a spare for the feature passes
 fn ensure_slots(slots: usize) -> Result<()> {

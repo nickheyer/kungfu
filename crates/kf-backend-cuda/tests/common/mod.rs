@@ -156,6 +156,8 @@ pub fn rel_err(got: &[f32], want: &[f32]) -> f32 {
 }
 
 pub fn assert_close(what: &str, got: &[f32], want: &[f32], tol: f32) {
+    let bad = got.iter().position(|v| !v.is_finite());
+    assert!(bad.is_none(), "{what}: non finite output at {bad:?} of {}", got.len());
     let e = rel_err(got, want);
     assert!(e <= tol, "{what}: relative error {e} above {tol}");
 }

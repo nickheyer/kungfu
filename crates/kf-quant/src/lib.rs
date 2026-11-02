@@ -1,4 +1,5 @@
 pub mod types;
+pub use types::q8_0::quantize_row as quantize_row_q8_0;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod simd;

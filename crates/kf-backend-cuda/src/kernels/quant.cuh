@@ -424,6 +424,7 @@ struct KfMvRing {
 };
 
 #include "mm_i8.cuh"
+#include "mm_frag.cuh"
 
 // Product of up to NR rows of int8 activations against native weight rows, eight warps a block, wpr of them per output
 // row over interleaved steps of its columns and joined through shared memory. The activations come with scales and

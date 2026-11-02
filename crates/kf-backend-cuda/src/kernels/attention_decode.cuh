@@ -428,7 +428,7 @@ __device__ __forceinline__ void kf_attention_decode(int bx, int by, int bz, int 
     if (slice) {
         if (tid == 0) counters[cslot] = 0;
         const int c_hi = c_lo + cols_kv;
-        const KfActRow o = kf_act_row(qo, s16o, m16o, s32o, m32o, r, n);
+        const KfActRow o = kf_act_row(qo, s16o, m16o, s32o, m32o, r, n, rows);
         for (int span = c_lo + warp * 256; span < c_hi; span += KF_DEC_WARPS * 256) {
             int c0 = span + lane * 8;
             float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -447,7 +447,7 @@ __device__ __forceinline__ void kf_attention_decode(int bx, int by, int bz, int 
     // Every head of the row is joined: quantize the row for the product that follows
     for (int i = tid; i < n; i += blockDim.x) rowbuf[i] = __ldcg(out + (i64)r * n + i);
     __syncthreads();
-    const KfActRow o = kf_act_row(qo, s16o, m16o, s32o, m32o, r, n);
+    const KfActRow o = kf_act_row(qo, s16o, m16o, s32o, m32o, r, n, rows);
     for (int span = warp * 256; span < n; span += KF_DEC_WARPS * 256) {
         int c0 = span + lane * 8;
         float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};

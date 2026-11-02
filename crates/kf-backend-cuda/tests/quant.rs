@@ -61,6 +61,27 @@ fn matvec_and_matmul_match_reference_for_every_type() {
 }
 
 /// The int8 tensor core tile over every block type, row counts and widths that leave partial 64 by 64 tiles and partial 64 wide k steps
+/// The fragment product over every row count it serves, widths of one to sixteen super blocks so every warp split
+/// joins, and an output count off the sixteen row group
+#[test]
+fn fragment_product_matches_reference() {
+    let mut gpu = cuda();
+    let mut cpu = CpuBackend::new();
+    let mut rng = Rng(0x5151_1234_8765_0001);
+    let mut w = Mem::default();
+    for (n_in, n_out) in [(256, 130), (512, 42), (768, 48), (4096, 200)] {
+        let table = embed_table(&mut w, &mut rng, n_in);
+        let bias = w.f32("bias", &[n_out], &rng.vec(n_out, 0.5));
+        for name in ["q4_K", "q6_K"] {
+            let q = kf_quant::by_name(name).expect("plan type");
+            let id = w.add(name, q.info().id, &[n_in, n_out], synth(&mut rng, q.info().id, n_out, n_in));
+            for (rows, with_bias) in [(2, false), (5, true), (8, false), (9, true), (16, false), (17, true), (24, false), (25, true), (32, true)] {
+                check_matmul(&format!("fragment {name} n_in {n_in}"), &w, table, id, with_bias.then_some(bias), rows, &mut cpu, &mut gpu, 1e-5);
+            }
+        }
+    }
+}
+
 #[test]
 fn int8_tensor_core_matmul_matches_reference_for_every_block_type() {
     let mut gpu = cuda();

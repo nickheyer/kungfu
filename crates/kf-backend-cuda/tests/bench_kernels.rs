@@ -28,6 +28,76 @@ fn product_kernels() {
     }
 }
 
+/// The fragment product against the tile and the matvec on the same bytes, run with --ignored --nocapture, KF_BENCH_TYPES
+/// and KF_BENCH_SHAPES as for product_kernels
+#[test]
+#[ignore]
+fn frag_kinds() {
+    let mut rng = Rng(0x1234_5678_9abc_def1);
+    let shapes = std::env::var("KF_BENCH_SHAPES").unwrap_or_else(|_| "16x2048x16384,16x8192x2048,16x2048x2048,8x2048x16384,24x2048x16384,32x2048x16384,2x2048x16384,16x2048x128256".into());
+    let types = std::env::var("KF_BENCH_TYPES").unwrap_or_else(|_| "q4_K".into());
+    let mut gpu = cuda();
+    for shape in shapes.split(',') {
+        let dims: Vec<usize> = shape.split('x').map(|v| v.parse().expect("shape")).collect();
+        let (rows, n_in, n_out) = (dims[0], dims[1], dims[2]);
+        for name in types.split(',') {
+            let q = kf_quant::by_name(name).expect("type");
+            let bytes = synth(&mut rng, q.info().id, n_out, n_in);
+            let wbytes = bytes.len() as f64;
+            for kind in [kf_backend_cuda::Multi::Frag, kf_backend_cuda::Multi::Tile] {
+                match kf_backend_cuda::bench::product_kind_us(&mut gpu, q.info().id, &bytes, rows, n_in, n_out, 20, Some(kind)) {
+                    Ok((t, _)) => eprintln!("{name:8} {rows}x{n_in}x{n_out} {kind:?}: {t:8.1} us  {:6.0} GB/s", wbytes / t / 1e3),
+                    Err(e) => eprintln!("{name:8} {rows}x{n_in}x{n_out} {kind:?}: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
+/// The fragment product under its bench knobs, run with --ignored --nocapture, KF_BENCH_TYPES and KF_BENCH_SHAPES as for
+/// product_kernels and KF_BENCH_VARIANTS a comma list of the variant labels to run
+#[test]
+#[ignore]
+fn frag_variants() {
+    let mut rng = Rng(0x1234_5678_9abc_def1);
+    let shapes = std::env::var("KF_BENCH_SHAPES").unwrap_or_else(|_| "16x2048x16384,2x2048x16384".into());
+    let types = std::env::var("KF_BENCH_TYPES").unwrap_or_else(|_| "q4_K".into());
+    let variants: Vec<(&str, &str, Option<usize>, Option<usize>)> = vec![
+        ("base", "", None, None),
+        ("stages3", "#define KF_FRAG_STAGES 3", Some(3), None),
+        ("warps4", "#define KF_FRAG_WARPS 4", None, Some(4)),
+        ("warps8", "#define KF_FRAG_WARPS 8", None, Some(8)),
+        ("warps4 stages3", "#define KF_FRAG_WARPS 4\n#define KF_FRAG_STAGES 3", Some(3), Some(4)),
+        ("no mma", "#define KF_FRAG_NO_MMA 1", None, None),
+        ("no b", "#define KF_FRAG_BFAKE 1", None, None),
+        ("no xs", "#define KF_FRAG_NO_XS 1", None, None),
+        ("no b no xs", "#define KF_FRAG_BFAKE 1\n#define KF_FRAG_NO_XS 1", None, None),
+        ("no mma no b no xs", "#define KF_FRAG_NO_MMA 1\n#define KF_FRAG_BFAKE 1\n#define KF_FRAG_NO_XS 1", None, None),
+        ("no decode", "#define KF_FRAG_NO_DECODE 1", None, None),
+        ("stream only", "#define KF_FRAG_NO_MMA 1\n#define KF_FRAG_BFAKE 1\n#define KF_FRAG_NO_XS 1\n#define KF_FRAG_NO_DECODE 1", None, None),
+    ];
+    let only = std::env::var("KF_BENCH_VARIANTS").ok();
+    let mut gpu = cuda();
+    for shape in shapes.split(',') {
+        let dims: Vec<usize> = shape.split('x').map(|v| v.parse().expect("shape")).collect();
+        let (rows, n_in, n_out) = (dims[0], dims[1], dims[2]);
+        for name in types.split(',') {
+            let q = kf_quant::by_name(name).expect("type");
+            let bytes = synth(&mut rng, q.info().id, n_out, n_in);
+            let wbytes = bytes.len() as f64;
+            for (label, defines, stages, warps) in &variants {
+                if only.as_ref().is_some_and(|o| !o.split(',').any(|v| v == *label)) {
+                    continue;
+                }
+                match kf_backend_cuda::bench::frag_variant_us(&mut gpu, defines, *stages, *warps, q.info().id, &bytes, rows, n_in, n_out, 20) {
+                    Ok(t) => eprintln!("{name:8} {rows}x{n_in}x{n_out} {label:18}: {t:8.1} us  {:6.0} GB/s", wbytes / t / 1e3),
+                    Err(e) => eprintln!("{name:8} {rows}x{n_in}x{n_out} {label:18}: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
 /// The KF8 product under source variants, run with --ignored --nocapture, KF_BENCH_TYPES and KF_BENCH_SHAPES as for product_kernels
 #[test]
 #[ignore]

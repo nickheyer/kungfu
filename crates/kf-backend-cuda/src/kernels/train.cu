@@ -1,6 +1,6 @@
 #include "common.cuh"
 
-// The kernels a draft head learns with: a single precision product with either operand transposed, the gated
+// The kernels a draft head learns with, a single precision product with either operand transposed, the gated
 // activation and the rms norm with their backward passes, AdamW, and the smooth L1 loss with its gradient. The
 // product is a 64 by 64 tile of 256 threads, four by four outputs each, over sixteen deep steps staged through shared
 // memory, the transposes resolved while staging.
@@ -128,21 +128,6 @@ extern "C" __global__ void adamw(float* p, const float* g, float* m, float* v, i
     }
 }
 
-// Smooth L1 between pred and target over n values, the mean loss added into loss and the gradient of the mean into grad
-extern "C" __global__ void smooth_l1(const float* pred, const float* target, float* grad, float* loss, i64 n, float beta) {
-    __shared__ float red[32];
-    float s = 0.0f;
-    const float inv_n = 1.0f / (float)n;
-    for (i64 i = blockIdx.x * (i64)blockDim.x + threadIdx.x; i < n; i += (i64)gridDim.x * blockDim.x) {
-        const float d = pred[i] - target[i];
-        const float a = fabsf(d);
-        s += a < beta ? 0.5f * d * d / beta : a - 0.5f * beta;
-        grad[i] = (a < beta ? d / beta : (d > 0.0f ? 1.0f : -1.0f)) * inv_n;
-    }
-    s = kf_block_sum(s, red);
-    if (threadIdx.x == 0) atomicAdd(loss, s * inv_n);
-}
-
 // y += alpha x
 extern "C" __global__ void axpy(const float* x, float* y, i64 n, float alpha) {
     for (i64 i = blockIdx.x * (i64)blockDim.x + threadIdx.x; i < n; i += (i64)gridDim.x * blockDim.x) y[i] = fmaf(alpha, x[i], y[i]);
@@ -161,181 +146,6 @@ extern "C" __global__ void gather_rows_h(const u16* src, const int* idx, float* 
     for (i64 t = blockIdx.x * (i64)blockDim.x + threadIdx.x; t < (i64)rows * cols; t += (i64)gridDim.x * blockDim.x) {
         const int r = (int)(t / cols), c = (int)(t - (i64)r * cols);
         dst[t] = kf_h2f(src[(i64)idx[r] * cols + c]);
-    }
-}
-
-// Attention of a draft head over chunks of T positions, one block per sequence and head, every query seeing the keys
-// at or before it within the window. Keys and values of the chunk sit in shared memory, the scores and probabilities
-// of the chunk in registers and shared memory, the probabilities written out for the backward pass.
-#define KF_TA_T 64
-#define KF_TA_THREADS 256
-
-// q k v [B, T, H hd] row major with the heads side by side, out the same, probs [B, H, T, T]
-extern "C" __global__ void __launch_bounds__(KF_TA_THREADS) head_attn_fwd(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ out, float* __restrict__ probs, int T, int H, int hd, int window, float scale) {
-    extern __shared__ float sm[];
-    float* ks = sm;
-    float* vs = ks + KF_TA_T * hd;
-    float* ps = vs + KF_TA_T * hd;
-    const int b = blockIdx.x / H, h = blockIdx.x - b * H;
-    const int tid = threadIdx.x, D = H * hd;
-    const i64 base = (i64)b * T * D + (i64)h * hd;
-    for (int i = tid; i < T * hd; i += KF_TA_THREADS) {
-        const int t = i / hd, d = i - t * hd;
-        ks[t * hd + d] = k[base + (i64)t * D + d];
-        vs[t * hd + d] = v[base + (i64)t * D + d];
-    }
-    __syncthreads();
-    // Scores, each thread a run of (i, j) pairs
-    for (int e = tid; e < T * T; e += KF_TA_THREADS) {
-        const int i = e / T, j = e - i * T;
-        float s = KF_NEG_INF;
-        if (j <= i && j > i - window) {
-            s = 0.0f;
-            const float* qi = q + base + (i64)i * D;
-            for (int d = 0; d < hd; d++) s = fmaf(qi[d], ks[j * hd + d], s);
-            s *= scale;
-        }
-        ps[e] = s;
-    }
-    __syncthreads();
-    // Softmax of every row, four threads a row
-    for (int i = tid / 4; i < T; i += KF_TA_THREADS / 4) {
-        const int part = tid & 3;
-        float m = KF_NEG_INF;
-        for (int j = part; j < T; j += 4) m = fmaxf(m, ps[i * T + j]);
-#pragma unroll
-        for (int o = 1; o < 4; o <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-        float l = 0.0f;
-        for (int j = part; j < T; j += 4) {
-            const float p = ps[i * T + j] == KF_NEG_INF ? 0.0f : __expf(ps[i * T + j] - m);
-            ps[i * T + j] = p;
-            l += p;
-        }
-#pragma unroll
-        for (int o = 1; o < 4; o <<= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
-        const float inv = 1.0f / l;
-        for (int j = part; j < T; j += 4) ps[i * T + j] *= inv;
-    }
-    __syncthreads();
-    float* pout = probs + ((i64)b * H + h) * T * T;
-    for (int e = tid; e < T * T; e += KF_TA_THREADS) pout[e] = ps[e];
-    // Output rows
-    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
-        const int i = e / hd, d = e - i * hd;
-        float o = 0.0f;
-        for (int j = 0; j <= i; j++) o = fmaf(ps[i * T + j], vs[j * hd + d], o);
-        out[base + (i64)i * D + d] = o;
-    }
-}
-
-// Gradients of head_attn_fwd given dout and the saved probabilities: dv = P^T do, ds = P (dp - rowsum(dp P)) with
-// dp = do v^T, dq = ds k scale, dk = ds^T q scale
-extern "C" __global__ void __launch_bounds__(KF_TA_THREADS) head_attn_bwd(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ probs, const float* __restrict__ dout, float* __restrict__ dq, float* __restrict__ dk, float* __restrict__ dv, int T, int H, int hd, float scale) {
-    extern __shared__ float sm[];
-    float* as = sm;
-    float* bs = as + KF_TA_T * hd;
-    float* ps = bs + KF_TA_T * hd;
-    const int b = blockIdx.x / H, h = blockIdx.x - b * H;
-    const int tid = threadIdx.x, D = H * hd;
-    const i64 base = (i64)b * T * D + (i64)h * hd;
-    const float* pin = probs + ((i64)b * H + h) * T * T;
-    // Phase one, v and do in shared memory: dv = P^T do and dp = do v^T, dp overwriting ps as ds
-    for (int i = tid; i < T * hd; i += KF_TA_THREADS) {
-        const int t = i / hd, d = i - t * hd;
-        as[t * hd + d] = v[base + (i64)t * D + d];
-        bs[t * hd + d] = dout[base + (i64)t * D + d];
-    }
-    for (int e = tid; e < T * T; e += KF_TA_THREADS) ps[e] = pin[e];
-    __syncthreads();
-    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
-        const int j = e / hd, d = e - j * hd;
-        float s = 0.0f;
-        for (int i = j; i < T; i++) s = fmaf(ps[i * T + j], bs[i * hd + d], s);
-        dv[base + (i64)j * D + d] = s;
-    }
-    __syncthreads();
-    // ds rows, four threads a row: dp(i, j) = do_i . v_j, then ds = P (dp - sum_j P dp)
-    for (int i = tid / 4; i < T; i += KF_TA_THREADS / 4) {
-        const int part = tid & 3;
-        float dot = 0.0f;
-        for (int j = part; j <= i; j += 4) {
-            float dp = 0.0f;
-            for (int d = 0; d < hd; d++) dp = fmaf(bs[i * hd + d], as[j * hd + d], dp);
-            dot += ps[i * T + j] * dp;
-            // The products of this row are needed again below, kept in the upper half of the padded row space
-            ps[i * T + j] = ps[i * T + j] * dp;
-        }
-#pragma unroll
-        for (int o = 1; o < 4; o <<= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
-        for (int j = part; j < T; j += 4) {
-            if (j <= i) {
-                const float p = pin[i * T + j];
-                ps[i * T + j] = ps[i * T + j] - p * dot;
-            } else {
-                ps[i * T + j] = 0.0f;
-            }
-        }
-    }
-    __syncthreads();
-    // Phase two, k and q in shared memory: dq = ds k scale, dk = ds^T q scale
-    for (int i = tid; i < T * hd; i += KF_TA_THREADS) {
-        const int t = i / hd, d = i - t * hd;
-        as[t * hd + d] = k[base + (i64)t * D + d];
-        bs[t * hd + d] = q[base + (i64)t * D + d];
-    }
-    __syncthreads();
-    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
-        const int i = e / hd, d = e - i * hd;
-        float s = 0.0f;
-        for (int j = 0; j <= i; j++) s = fmaf(ps[i * T + j], as[j * hd + d], s);
-        dq[base + (i64)i * D + d] = s * scale;
-        float t = 0.0f;
-        for (int ii = i; ii < T; ii++) t = fmaf(ps[ii * T + i], bs[ii * hd + d], t);
-        dk[base + (i64)i * D + d] = t * scale;
-    }
-}
-
-// Attention of m draft rows, one block per row and head, each row seeing its slot's window of nwin cached keys and
-// values, the keys and values of its ancestors among the draft rows, listed per row as up to KF_TD_ANC indices into
-// kanc and vanc with minus one ending the list, and itself, whose key and value stand in kanc and vanc at its own index
-#define KF_TD_ANC 8
-extern "C" __global__ void __launch_bounds__(256) head_attn_draft(const float* __restrict__ q, const float* __restrict__ kwin, const float* __restrict__ vwin, int nwin, const float* __restrict__ kanc, const float* __restrict__ vanc, const int* __restrict__ anc, float* __restrict__ out, int H, int hd, float scale) {
-    extern __shared__ float sm[];
-    float* qs = sm;
-    float* sc = qs + hd;
-    const int r = blockIdx.x / H, h = blockIdx.x - r * H, tid = threadIdx.x, D = H * hd;
-    for (int d = tid; d < hd; d += blockDim.x) qs[d] = q[(i64)r * D + h * hd + d];
-    __syncthreads();
-    // Keys: the window first, then the ancestors and the row itself
-    int nanc = 0;
-    while (nanc < KF_TD_ANC && anc[r * KF_TD_ANC + nanc] >= 0) nanc++;
-    const int nk = nwin + nanc;
-    for (int j = tid; j < nk; j += blockDim.x) {
-        const float* kj = j < nwin ? kwin + (i64)j * D + h * hd : kanc + (i64)anc[r * KF_TD_ANC + (j - nwin)] * D + h * hd;
-        float s = 0.0f;
-        for (int d = 0; d < hd; d++) s = fmaf(qs[d], kj[d], s);
-        sc[j] = s * scale;
-    }
-    __syncthreads();
-    __shared__ float red[32];
-    float m = KF_NEG_INF;
-    for (int j = tid; j < nk; j += blockDim.x) m = fmaxf(m, sc[j]);
-    m = kf_block_max(m, red);
-    float l = 0.0f;
-    for (int j = tid; j < nk; j += blockDim.x) {
-        const float p = __expf(sc[j] - m);
-        sc[j] = p;
-        l += p;
-    }
-    l = kf_block_sum(l, red);
-    const float inv = 1.0f / l;
-    for (int d = tid; d < hd; d += blockDim.x) {
-        float o = 0.0f;
-        for (int j = 0; j < nk; j++) {
-            const float* vj = j < nwin ? vwin + (i64)j * D + h * hd : vanc + (i64)anc[r * KF_TD_ANC + (j - nwin)] * D + h * hd;
-            o = fmaf(sc[j], vj[d], o);
-        }
-        out[(i64)r * D + h * hd + d] = o * inv;
     }
 }
 
@@ -393,5 +203,589 @@ extern "C" __global__ void gemm_skinny_reduce(const float* __restrict__ parts, f
         for (int p = 0; p < splits; p++) s += parts[((i64)p * M + r) * N + n];
         float* c = C + (i64)r * ldc + n;
         *c = beta == 0.0f ? alpha * s : fmaf(alpha, s, beta * *c);
+    }
+}
+
+#define KF_TA_T 64
+#define KF_TA_THREADS 256
+#define KF_DA_ANC 80
+#define KF_SOFT_K 64
+#define KF_BV_DEPTH 8
+
+// Attention of m draft rows, one block per row and head, each row sees the rows of its slot's history ring whose
+// positions lie at or before its own and within the window, the rows its ancestor list names among the node rows,
+// and itself, which stands in the node rows at its own index. The ring holds cap rows by position modulo cap, hpos
+// naming the position of each ring row and a negative position an empty one.
+#define KF_DA_ANC 80
+#define KF_SOFT_K 64
+extern "C" __global__ void __launch_bounds__(256) draft_attn(const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring, const int* __restrict__ hpos, int cap, const float* __restrict__ knode, const float* __restrict__ vnode, const int* __restrict__ anc, const int* __restrict__ pos, int window, float* __restrict__ out, int H, int hd, float scale) {
+    extern __shared__ float sm[];
+    float* qs = sm;
+    float* sc = qs + hd;
+    const int r = blockIdx.x / H, h = blockIdx.x - r * H, tid = threadIdx.x, D = H * hd;
+    for (int d = tid; d < hd; d += blockDim.x) qs[d] = q[(i64)r * D + h * hd + d];
+    __syncthreads();
+    int nanc = 0;
+    while (nanc < KF_DA_ANC && anc[r * KF_DA_ANC + nanc] >= 0) nanc++;
+    const int p = pos[r];
+    const int nk = cap + nanc;
+    for (int j = tid; j < nk; j += blockDim.x) {
+        float s = KF_NEG_INF;
+        const float* kj = nullptr;
+        if (j < cap) {
+            const int hp = hpos[j];
+            if (hp >= 0 && hp <= p && hp + window > p) kj = kring + (i64)j * D + h * hd;
+        } else {
+            kj = knode + (i64)anc[r * KF_DA_ANC + (j - cap)] * D + h * hd;
+        }
+        if (kj) {
+            s = 0.0f;
+            for (int d = 0; d < hd; d++) s = fmaf(qs[d], kj[d], s);
+            s *= scale;
+        }
+        sc[j] = s;
+    }
+    __syncthreads();
+    __shared__ float red[32];
+    float m = KF_NEG_INF;
+    for (int j = tid; j < nk; j += blockDim.x) m = fmaxf(m, sc[j]);
+    m = kf_block_max(m, red);
+    float l = 0.0f;
+    for (int j = tid; j < nk; j += blockDim.x) {
+        const float e = sc[j] == KF_NEG_INF ? 0.0f : __expf(sc[j] - m);
+        sc[j] = e;
+        l += e;
+    }
+    l = kf_block_sum(l, red);
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (int d = tid; d < hd; d += blockDim.x) {
+        float o = 0.0f;
+        for (int j = 0; j < nk; j++) {
+            if (sc[j] == 0.0f) continue;
+            const float* vj = j < cap ? vring + (i64)j * D + h * hd : vnode + (i64)anc[r * KF_DA_ANC + (j - cap)] * D + h * hd;
+            o = fmaf(sc[j], vj[d], o);
+        }
+        out[(i64)r * D + h * hd + d] = o * inv;
+    }
+}
+
+// Attention of one query group of the block's training at drafted step `step`, one block per chunk and head
+// query row i sees the window keys at or before it within the window, strictly before it when self_key is zero,
+// and its own row at every chain step first to step, the last of those itself. The chain keys and values of step m
+// lie at m times stepstride floats into k and v, the window keys in kwin and vwin as [B T D]. Probabilities go out
+// as [B, H, T, T + chain] rows for the backward pass, chain being step minus first plus one.
+extern "C" __global__ void __launch_bounds__(KF_TA_THREADS) chain_attn_fwd(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, i64 stepstride, int step, const float* __restrict__ kwin, const float* __restrict__ vwin, int first, int self_key, float* __restrict__ out, float* __restrict__ probs, int T, int H, int hd, int window, float scale) {
+    extern __shared__ float sm[];
+    float* ks = sm;
+    float* vs = ks + KF_TA_T * hd;
+    float* ps = vs + KF_TA_T * hd;
+    const int b = blockIdx.x / H, h = blockIdx.x - b * H;
+    const int tid = threadIdx.x, D = H * hd, chain = step - first + 1, nk = T + chain;
+    const i64 base = (i64)b * T * D + (i64)h * hd;
+    for (int i = tid; i < T * hd; i += KF_TA_THREADS) {
+        const int t = i / hd, d = i - t * hd;
+        ks[t * hd + d] = kwin[base + (i64)t * D + d];
+        vs[t * hd + d] = vwin[base + (i64)t * D + d];
+    }
+    __syncthreads();
+    const float* qk = q + (i64)step * stepstride;
+    for (int e = tid; e < T * nk; e += KF_TA_THREADS) {
+        const int i = e / nk, j = e - i * nk;
+        float s = KF_NEG_INF;
+        const float* qi = qk + base + (i64)i * D;
+        if (j < T) {
+            const bool seen = self_key ? (j <= i) : (j < i);
+            if (seen && j > i - window) {
+                s = 0.0f;
+                for (int d = 0; d < hd; d++) s = fmaf(qi[d], ks[j * hd + d], s);
+                s *= scale;
+            }
+        } else {
+            const float* kj = k + (i64)(first + j - T) * stepstride + base + (i64)i * D;
+            s = 0.0f;
+            for (int d = 0; d < hd; d++) s = fmaf(qi[d], kj[d], s);
+            s *= scale;
+        }
+        ps[e] = s;
+    }
+    __syncthreads();
+    for (int i = tid / 4; i < T; i += KF_TA_THREADS / 4) {
+        const int part = tid & 3;
+        float m = KF_NEG_INF;
+        for (int j = part; j < nk; j += 4) m = fmaxf(m, ps[i * nk + j]);
+#pragma unroll
+        for (int o = 1; o < 4; o <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float l = 0.0f;
+        for (int j = part; j < nk; j += 4) {
+            const float p = ps[i * nk + j] == KF_NEG_INF ? 0.0f : __expf(ps[i * nk + j] - m);
+            ps[i * nk + j] = p;
+            l += p;
+        }
+#pragma unroll
+        for (int o = 1; o < 4; o <<= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+        const float inv = 1.0f / l;
+        for (int j = part; j < nk; j += 4) ps[i * nk + j] *= inv;
+    }
+    __syncthreads();
+    float* pout = probs + ((i64)b * H + h) * T * nk;
+    for (int e = tid; e < T * nk; e += KF_TA_THREADS) pout[e] = ps[e];
+    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
+        const int i = e / hd, d = e - i * hd;
+        float o = 0.0f;
+        for (int j = 0; j <= i && j < T; j++) o = fmaf(ps[i * nk + j], vs[j * hd + d], o);
+        for (int c = 0; c < chain; c++) o = fmaf(ps[i * nk + T + c], v[(i64)(first + c) * stepstride + base + (i64)i * D + d], o);
+        out[(i64)step * stepstride + base + (i64)i * D + d] = o;
+    }
+}
+
+// Gradients of chain_attn_fwd given dout and the saved probabilities. dq lands at step `step` of dq, the window
+// keys' gradients add into dkwin and dvwin, the chain rows' into dk and dv at their steps, so every buffer
+// accumulates the contributions of the later steps' queries.
+extern "C" __global__ void __launch_bounds__(KF_TA_THREADS) chain_attn_bwd(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, i64 stepstride, int step, const float* __restrict__ kwin, const float* __restrict__ vwin, int first, const float* __restrict__ probs, const float* __restrict__ dout, float* __restrict__ dq, float* __restrict__ dk, float* __restrict__ dv, float* __restrict__ dkwin, float* __restrict__ dvwin, int T, int H, int hd, float scale) {
+    extern __shared__ float sm[];
+    float* as = sm;
+    float* bs = as + KF_TA_T * hd;
+    float* ps = bs + KF_TA_T * hd;
+    const int b = blockIdx.x / H, h = blockIdx.x - b * H;
+    const int tid = threadIdx.x, D = H * hd, chain = step - first + 1, nk = T + chain;
+    const i64 base = (i64)b * T * D + (i64)h * hd;
+    const i64 at = (i64)step * stepstride;
+    const float* pin = probs + ((i64)b * H + h) * T * nk;
+    // Phase one, window v and this step's dout staged, dv for the window keys, dp = do v for every key, ds kept in ps
+    for (int i = tid; i < T * hd; i += KF_TA_THREADS) {
+        const int t = i / hd, d = i - t * hd;
+        as[t * hd + d] = vwin[base + (i64)t * D + d];
+        bs[t * hd + d] = dout[at + base + (i64)t * D + d];
+    }
+    for (int e = tid; e < T * nk; e += KF_TA_THREADS) ps[e] = pin[e];
+    __syncthreads();
+    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
+        const int j = e / hd, d = e - j * hd;
+        float s = 0.0f;
+        for (int i = j; i < T; i++) s = fmaf(ps[i * nk + j], bs[i * hd + d], s);
+        dvwin[base + (i64)j * D + d] += s;
+    }
+    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
+        const int i = e / hd, d = e - i * hd;
+        for (int c = 0; c < chain; c++) dv[(i64)(first + c) * stepstride + base + (i64)i * D + d] += ps[i * nk + T + c] * bs[i * hd + d];
+    }
+    __syncthreads();
+    for (int i = tid / 4; i < T; i += KF_TA_THREADS / 4) {
+        const int part = tid & 3;
+        float dot = 0.0f;
+        for (int j = part; j < nk; j += 4) {
+            const float p = ps[i * nk + j];
+            if (p == 0.0f) continue;
+            float dp = 0.0f;
+            if (j < T) {
+                for (int d = 0; d < hd; d++) dp = fmaf(bs[i * hd + d], as[j * hd + d], dp);
+            } else {
+                const float* vj = v + (i64)(first + j - T) * stepstride + base + (i64)i * D;
+                for (int d = 0; d < hd; d++) dp = fmaf(bs[i * hd + d], vj[d], dp);
+            }
+            dot += p * dp;
+            ps[i * nk + j] = p * dp;
+        }
+#pragma unroll
+        for (int o = 1; o < 4; o <<= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+        for (int j = part; j < nk; j += 4) {
+            const float p = pin[i * nk + j];
+            ps[i * nk + j] = p == 0.0f ? 0.0f : ps[i * nk + j] - p * dot;
+        }
+    }
+    __syncthreads();
+    // Phase two, window k and this step's q staged, dq for this step's rows, dk for the window and chain rows
+    for (int i = tid; i < T * hd; i += KF_TA_THREADS) {
+        const int t = i / hd, d = i - t * hd;
+        as[t * hd + d] = kwin[base + (i64)t * D + d];
+        bs[t * hd + d] = q[at + base + (i64)t * D + d];
+    }
+    __syncthreads();
+    for (int e = tid; e < T * hd; e += KF_TA_THREADS) {
+        const int i = e / hd, d = e - i * hd;
+        float s = 0.0f;
+        for (int j = 0; j <= i; j++) s = fmaf(ps[i * nk + j], as[j * hd + d], s);
+        for (int c = 0; c < chain; c++) s = fmaf(ps[i * nk + T + c], k[(i64)(first + c) * stepstride + base + (i64)i * D + d], s);
+        dq[at + base + (i64)i * D + d] = s * scale;
+        float t = 0.0f;
+        for (int ii = i; ii < T; ii++) t = fmaf(ps[ii * nk + i], bs[ii * hd + d], t);
+        dkwin[base + (i64)i * D + d] += t * scale;
+        for (int c = 0; c < chain; c++) dk[(i64)(first + c) * stepstride + base + (i64)i * D + d] += ps[i * nk + T + c] * bs[i * hd + d] * scale;
+    }
+}
+
+// The soft target of one row read from packed candidates, k ids as floats then k logits then the log sum exp,
+// every id mapped to a draft column by lut or dropped below zero, the kept mass renormalized into ps
+__device__ __forceinline__ float kf_soft_target(const float* c, int k, const int* lut, int* cols, float* ps, float* red) {
+    const float lse_t = c[2 * k];
+    float mass = 0.0f;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const int col = lut[(int)c[i]];
+        cols[i] = col;
+        const float p = col >= 0 ? __expf(c[k + i] - lse_t) : 0.0f;
+        ps[i] = p;
+        mass += p;
+    }
+    return kf_block_sum(mass, red);
+}
+
+// The log sum exp of one row of V logits over the block
+__device__ __forceinline__ float kf_row_lse(const float* zr, int V, float* red) {
+    float m = KF_NEG_INF;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) m = fmaxf(m, zr[j]);
+    m = kf_block_max(m, red);
+    float l = 0.0f;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) l += __expf(zr[j] - m);
+    l = kf_block_sum(l, red);
+    return m + __logf(l);
+}
+
+// Cross entropy of rows of logits over a draft vocabulary against soft targets from packed candidate rows, weighted
+// per row, the row's own loss into losses, minus one for a row without a target, its weighted loss into loss, the
+// rows with a target into counted, and dz the weight times softmax minus target for rows with a target and zero
+// elsewhere.
+extern "C" __global__ void __launch_bounds__(256) soft_ce(const float* __restrict__ z, int V, const float* __restrict__ cands, int k, const int* __restrict__ lut, const float* __restrict__ w, float* __restrict__ dz, float* __restrict__ losses, float* __restrict__ loss, int* __restrict__ counted) {
+    __shared__ float red[32];
+    __shared__ int cols[KF_SOFT_K];
+    __shared__ float ps[KF_SOFT_K];
+    __shared__ float mass_s;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* zr = z + (i64)r * V;
+    float* dr = dz + (i64)r * V;
+    const float mass = kf_soft_target(cands + (i64)r * (2 * k + 1), k, lut, cols, ps, red);
+    if (tid == 0) mass_s = mass;
+    __syncthreads();
+    if (mass_s <= 0.0f) {
+        for (int j = tid; j < V; j += blockDim.x) dr[j] = 0.0f;
+        if (tid == 0) losses[r] = -1.0f;
+        return;
+    }
+    const float lse = kf_row_lse(zr, V, red);
+    const float wr = w[r];
+    for (int j = tid; j < V; j += blockDim.x) dr[j] = wr * __expf(zr[j] - lse);
+    __syncthreads();
+    float part = 0.0f;
+    for (int i = tid; i < k; i += blockDim.x) {
+        if (cols[i] < 0) continue;
+        const float p = ps[i] / mass_s;
+        part += p * (lse - zr[cols[i]]);
+        atomicAdd(&dr[cols[i]], -wr * p);
+    }
+    part = kf_block_sum(part, red);
+    if (tid == 0) {
+        losses[r] = part;
+        atomicAdd(loss, wr * part);
+        atomicAdd(counted, 1);
+    }
+}
+
+// Acceptance and rejection cost of every row's drafted position against its target, the mass the draft and the
+// target share over the candidates, and the target's mass the draft misses off the end column over the target's
+// mass off it, zero and zero for a row without a target
+extern "C" __global__ void __launch_bounds__(256) edr_terms(const float* __restrict__ z, int V, const float* __restrict__ cands, int k, const int* __restrict__ lut, int eos, float* __restrict__ a_out, float* __restrict__ c_out) {
+    __shared__ float red[32];
+    __shared__ int cols[KF_SOFT_K];
+    __shared__ float ps[KF_SOFT_K];
+    __shared__ float mass_s;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* zr = z + (i64)r * V;
+    const float mass = kf_soft_target(cands + (i64)r * (2 * k + 1), k, lut, cols, ps, red);
+    if (tid == 0) mass_s = mass;
+    __syncthreads();
+    if (mass_s <= 0.0f) {
+        if (tid == 0) {
+            a_out[r] = 0.0f;
+            c_out[r] = 0.0f;
+        }
+        return;
+    }
+    const float lse = kf_row_lse(zr, V, red);
+    float a = 0.0f, miss = 0.0f, p_eos = 0.0f;
+    for (int i = tid; i < k; i += blockDim.x) {
+        if (cols[i] < 0) continue;
+        const float p = ps[i] / mass_s, q = __expf(zr[cols[i]] - lse);
+        a += fminf(p, q);
+        if (cols[i] == eos) p_eos += p; else miss += fmaxf(p - q, 0.0f);
+    }
+    a = kf_block_sum(a, red);
+    miss = kf_block_sum(miss, red);
+    p_eos = kf_block_sum(p_eos, red);
+    if (tid == 0) {
+        a_out[r] = a;
+        c_out[r] = miss / fmaxf(1.0f - p_eos, 1e-6f);
+    }
+}
+
+// Gradient of every row's share of the expected rounds into its logits, scaled by w, the occupancy times the
+// rejection cost's slope plus the rounds saved by accepting times the acceptance's slope, through the softmax
+extern "C" __global__ void __launch_bounds__(256) edr_grad(const float* __restrict__ z, int V, const float* __restrict__ cands, int k, const int* __restrict__ lut, int eos, const float* __restrict__ omega, const float* __restrict__ dv, const float* __restrict__ w, float* __restrict__ dz) {
+    __shared__ float red[32];
+    __shared__ int cols[KF_SOFT_K];
+    __shared__ float ps[KF_SOFT_K];
+    __shared__ float gs[KF_SOFT_K];
+    __shared__ float mass_s, dot_s;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* zr = z + (i64)r * V;
+    float* dr = dz + (i64)r * V;
+    const float mass = kf_soft_target(cands + (i64)r * (2 * k + 1), k, lut, cols, ps, red);
+    if (tid == 0) mass_s = mass;
+    __syncthreads();
+    if (mass_s <= 0.0f || w[r] == 0.0f) return;
+    const float lse = kf_row_lse(zr, V, red);
+    float p_eos = 0.0f;
+    for (int i = tid; i < k; i += blockDim.x) if (cols[i] >= 0 && cols[i] == eos) p_eos += ps[i] / mass_s;
+    p_eos = kf_block_sum(p_eos, red);
+    const float norm = 1.0f / fmaxf(1.0f - p_eos, 1e-6f), om = omega[r], dvr = dv[r];
+    float dot = 0.0f;
+    for (int i = tid; i < k; i += blockDim.x) {
+        float g = 0.0f;
+        if (cols[i] >= 0) {
+            const float p = ps[i] / mass_s, q = __expf(zr[cols[i]] - lse);
+            if (q < p) {
+                if (cols[i] != eos) g -= om * norm;
+                g += om * dvr;
+            }
+            dot += q * g;
+        }
+        gs[i] = g;
+    }
+    dot = kf_block_sum(dot, red);
+    if (tid == 0) dot_s = dot;
+    __syncthreads();
+    const float wr = w[r];
+    for (int j = tid; j < V; j += blockDim.x) dr[j] = fmaf(-wr * __expf(zr[j] - lse), dot_s, dr[j]);
+    __syncthreads();
+    for (int i = tid; i < k; i += blockDim.x) {
+        if (cols[i] < 0 || gs[i] == 0.0f) continue;
+        atomicAdd(&dr[cols[i]], wr * __expf(zr[cols[i]] - lse) * gs[i]);
+    }
+}
+
+// The vocabulary integrated block verification loss of one row's drafted positions along the model's own path,
+// one block per row, the positions' logits lie step_stride floats apart from z plus the row, their candidates
+// cand_stride floats apart, truth holds every position's path column or minus one at the same stride in rows, and
+// the gradient times w adds into dz. The loss, log depth minus log the expected accepted length, lands in losses.
+extern "C" __global__ void __launch_bounds__(256) bv_row(const float* __restrict__ z, int V, i64 step_stride, const float* __restrict__ cands, int k, i64 cand_stride, const int* __restrict__ truth, int truth_stride, const int* __restrict__ lut, int depth, const float* __restrict__ w, float* __restrict__ dz, float* __restrict__ losses) {
+    __shared__ float red[32];
+    __shared__ int cols[KF_SOFT_K];
+    __shared__ float ps[KF_SOFT_K];
+    __shared__ float lses[KF_BV_DEPTH];
+    __shared__ float masses[KF_BV_DEPTH];
+    __shared__ float rr[KF_BV_DEPTH + 1], alpha[KF_BV_DEPTH + 1], sq[KF_BV_DEPTH + 1], sp[KF_BV_DEPTH + 1], bar[KF_BV_DEPTH + 1];
+    __shared__ int argmin[KF_BV_DEPTH + 1], ended;
+    __shared__ float e_s, dot_s;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    if (tid == 0) {
+        rr[0] = 1.0f;
+        alpha[0] = 1.0f;
+        argmin[0] = 0;
+        sq[0] = 0.0f;
+        sp[0] = 0.0f;
+        bar[0] = 0.0f;
+        ended = depth + 1;
+    }
+    __syncthreads();
+    // Forward over the positions, the score, its sums, and the path ratio and retention after it
+    for (int i = 1; i <= depth; i++) {
+        if (i >= ended) break;
+        const float* zr = z + (i64)(i - 1) * step_stride + (i64)r * V;
+        const float* c = cands + (i64)(i - 1) * cand_stride + (i64)r * (2 * k + 1);
+        const float mass = kf_soft_target(c, k, lut, cols, ps, red);
+        if (tid == 0) masses[i - 1] = mass;
+        __syncthreads();
+        if (mass <= 0.0f) {
+            if (tid == 0) ended = i;
+            __syncthreads();
+            break;
+        }
+        const float lse = kf_row_lse(zr, V, red);
+        if (tid == 0) lses[i - 1] = lse;
+        float b = 0.0f, s_q = 0.0f, s_p = 0.0f;
+        for (int j = tid; j < k; j += blockDim.x) {
+            if (cols[j] < 0) continue;
+            const float p = ps[j] / mass, q = __expf(zr[cols[j]] - lse);
+            const float qa = alpha[i - 1] * p, qr = rr[i - 1] * q;
+            if (qr < qa) { b += qr; s_q += q; } else { b += qa; s_p += p; }
+        }
+        b = kf_block_sum(b, red);
+        s_q = kf_block_sum(s_q, red);
+        s_p = kf_block_sum(s_p, red);
+        if (tid == 0) {
+            bar[i] = b;
+            sq[i] = s_q;
+            sp[i] = s_p;
+            const int y = truth[(i64)(i - 1) * truth_stride + r];
+            if (y < 0) {
+                rr[i] = 0.0f;
+                alpha[i] = 0.0f;
+                argmin[i] = i;
+            } else {
+                float py = 0.0f;
+                for (int j = 0; j < k; j++) if (cols[j] == y) py += ps[j] / mass;
+                py = fmaxf(py, 1e-6f);
+                const float qy = fmaxf(__expf(zr[y] - lse), 1e-12f);
+                rr[i] = rr[i - 1] * qy / py;
+                if (rr[i] < alpha[i - 1]) { alpha[i] = rr[i]; argmin[i] = i; } else { alpha[i] = alpha[i - 1]; argmin[i] = argmin[i - 1]; }
+            }
+        }
+        __syncthreads();
+    }
+    const int last = ended - 1;
+    float e = 0.0f;
+    for (int i = 1; i <= last; i++) e += bar[i];
+    e = fmaxf(e, 1e-12f);
+    if (tid == 0) {
+        e_s = e;
+        losses[r] = __logf((float)depth) - __logf(e);
+    }
+    __syncthreads();
+    const float scale = -w[r] / e_s;
+    if (w[r] == 0.0f) return;
+    // Backward over the positions, h over the candidates and the path column, then the softmax's pull
+    for (int i = 1; i <= last; i++) {
+        const float* zr = z + (i64)(i - 1) * step_stride + (i64)r * V;
+        float* dr = dz + (i64)(i - 1) * step_stride + (i64)r * V;
+        const float* c = cands + (i64)(i - 1) * cand_stride + (i64)r * (2 * k + 1);
+        kf_soft_target(c, k, lut, cols, ps, red);
+        __syncthreads();
+        const float mass = masses[i - 1], lse = lses[i - 1];
+        const int y = truth[(i64)(i - 1) * truth_stride + r];
+        float gain = 0.0f;
+        if (y >= 0) {
+            for (int kk = i + 1; kk <= last; kk++) {
+                gain += sq[kk] * rr[kk - 1];
+                if (alpha[kk - 1] < 1.0f && i <= argmin[kk - 1]) gain += sp[kk] * alpha[kk - 1];
+            }
+        }
+        float dot = 0.0f;
+        for (int j = tid; j < k; j += blockDim.x) {
+            if (cols[j] < 0) continue;
+            const float p = ps[j] / mass, q = __expf(zr[cols[j]] - lse);
+            if (rr[i - 1] * q < alpha[i - 1] * p) dot += rr[i - 1] * q;
+        }
+        dot = kf_block_sum(dot, red);
+        if (tid == 0) dot_s = dot + gain;
+        __syncthreads();
+        for (int u = tid; u < V; u += blockDim.x) dr[u] = fmaf(-scale * __expf(zr[u] - lse), dot_s, dr[u]);
+        __syncthreads();
+        for (int j = tid; j < k; j += blockDim.x) {
+            if (cols[j] < 0) continue;
+            const float p = ps[j] / mass, q = __expf(zr[cols[j]] - lse);
+            if (rr[i - 1] * q < alpha[i - 1] * p) atomicAdd(&dr[cols[j]], scale * rr[i - 1] * q);
+        }
+        if (tid == 0 && y >= 0) atomicAdd(&dr[y], scale * gain);
+        __syncthreads();
+    }
+}
+
+// One optimistic AdamW step at step t, p holds the played point, a step of the last direction u ahead of the
+// trained point, so the update recovers the trained point, moves it, and plays the new direction ahead
+extern "C" __global__ void adamw_opt(float* p, const float* g, float* m, float* v, float* u, i64 n, float lr, float b1, float b2, float eps, float wd, int t) {
+    const float c1 = 1.0f - powf(b1, (float)t), c2 = 1.0f - powf(b2, (float)t);
+    for (i64 i = blockIdx.x * (i64)blockDim.x + threadIdx.x; i < n; i += (i64)gridDim.x * blockDim.x) {
+        const float gi = g[i];
+        const float mi = m[i] = b1 * m[i] + (1.0f - b1) * gi;
+        const float vi = v[i] = b2 * v[i] + (1.0f - b2) * gi * gi;
+        const float un = (mi / c1) / (sqrtf(vi / c2) + eps);
+        const float w = p[i] + lr * u[i];
+        p[i] = w - lr * (un + wd * w) - lr * un;
+        u[i] = un;
+    }
+}
+
+// out = w0 a + w1 b + w2 c + w3 d, the weighted mixture of up to four parameter buffers, a null pointer weighing nothing
+extern "C" __global__ void mix4(float* out, const float* a, const float* b, const float* c, const float* d, float w0, float w1, float w2, float w3, i64 n) {
+    for (i64 i = blockIdx.x * (i64)blockDim.x + threadIdx.x; i < n; i += (i64)gridDim.x * blockDim.x) {
+        float s = w0 * a[i];
+        if (b) s = fmaf(w1, b[i], s);
+        if (c) s = fmaf(w2, c[i], s);
+        if (d) s = fmaf(w3, d[i], s);
+        out[i] = s;
+    }
+}
+
+// y = a y + (1 - a) x, the moving average the reference keeps
+extern "C" __global__ void ema(float* y, const float* x, i64 n, float a) {
+    for (i64 i = blockIdx.x * (i64)blockDim.x + threadIdx.x; i < n; i += (i64)gridDim.x * blockDim.x) y[i] = fmaf(a, y[i], (1.0f - a) * x[i]);
+}
+
+// The columns of a row major k by n matrix as n rows of q8_0 blocks, thread per column and block of 32, the block's
+// scale the largest magnitude over 127 as f16, its integers the values over that scale rounded to nearest even
+extern "C" __global__ void quant_q8_0_t(const float* __restrict__ src, u8* __restrict__ dst, int k, int n) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;
+    if (r >= n) return;
+    float vals[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        vals[j] = src[(i64)(b * 32 + j) * n + r];
+        amax = fmaxf(amax, fabsf(vals[j]));
+    }
+    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    u8* out = dst + (i64)r * (k / 32) * 34 + (i64)b * 34;
+    const u16 dh = kf_f2h(d);
+    out[0] = (u8)(dh & 0xff);
+    out[1] = (u8)(dh >> 8);
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        int q = __float2int_rn(vals[j] * id);
+        q = max(-127, min(127, q));
+        out[2 + j] = (u8)(i8)q;
+    }
+}
+
+// Predictive entropy of every row of V logits, the log sum exp less the mean logit under the softmax
+extern "C" __global__ void __launch_bounds__(256) row_entropy(const float* __restrict__ z, int V, float* __restrict__ out) {
+    __shared__ float red[32];
+    const float* zr = z + (i64)blockIdx.x * V;
+    float m = KF_NEG_INF;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) m = fmaxf(m, zr[j]);
+    m = kf_block_max(m, red);
+    float l = 0.0f, lz = 0.0f;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) {
+        const float e = __expf(zr[j] - m);
+        l += e;
+        lz = fmaf(e, zr[j], lz);
+    }
+    l = kf_block_sum(l, red);
+    lz = kf_block_sum(lz, red);
+    if (threadIdx.x == 0) out[blockIdx.x] = m + __logf(l) - lz / l;
+}
+
+// Adds n_sel rows of src, those idx names in order, into the block rows of z starting at slot off modulo block
+extern "C" __global__ void cal_accum(const float* __restrict__ src, const int* __restrict__ idx, int n_sel, int off, int block, float* __restrict__ z, int d) {
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < d; c += gridDim.x * blockDim.x) {
+        for (int i = 0; i < n_sel; i++) {
+            const int slot = (off + i) % block;
+            z[(i64)slot * d + c] += src[(i64)idx[i] * d + c];
+        }
+    }
+}
+
+// out[c] += the sum over rows of x[r][c]
+extern "C" __global__ void col_sum(const float* __restrict__ x, int rows, int cols, float* __restrict__ out) {
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < cols; c += gridDim.x * blockDim.x) {
+        float s = 0.0f;
+        for (int r = 0; r < rows; r++) s += x[(i64)r * cols + c];
+        out[c] += s;
+    }
+}
+
+// dst[r][off + c] = src[r][c] for rows of cols, dst rows stride floats apart
+extern "C" __global__ void copy_cols(const float* __restrict__ src, float* __restrict__ dst, int rows, int cols, i64 stride, int off) {
+    for (i64 t = blockIdx.x * (i64)blockDim.x + threadIdx.x; t < (i64)rows * cols; t += (i64)gridDim.x * blockDim.x) {
+        const int r = (int)(t / cols), c = (int)(t - (i64)r * cols);
+        dst[(i64)r * stride + off + c] = src[t];
+    }
+}
+
+// Rows of the step zero keys and values of drafted rows copied into a slot's position ring at their positions
+extern "C" __global__ void ring_write(const float* __restrict__ k, const float* __restrict__ v, const int* __restrict__ rows, const int* __restrict__ pos, int n, int cap, int D, float* __restrict__ kring, float* __restrict__ vring, int* __restrict__ hpos) {
+    for (i64 t = blockIdx.x * (i64)blockDim.x + threadIdx.x; t < (i64)n * D; t += (i64)gridDim.x * blockDim.x) {
+        const int i = (int)(t / D), d = (int)(t - (i64)i * D);
+        const int slot = pos[i] % cap;
+        kring[(i64)slot * D + d] = k[(i64)rows[i] * D + d];
+        vring[(i64)slot * D + d] = v[(i64)rows[i] * D + d];
+        if (d == 0) hpos[slot] = pos[i];
     }
 }

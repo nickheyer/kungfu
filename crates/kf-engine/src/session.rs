@@ -91,6 +91,10 @@ pub struct Session {
     n_vocab: usize,
     /// Candidates per row of logits
     top: usize,
+    /// Whether every row of a prompt pass is scored, for the draft block
+    draft: bool,
+    /// The layers whose residual rows every pass keeps for the draft block, in rising order
+    taps: Vec<usize>,
     /// Whether text positions pin every rotary stream and images take a grid, the multi stream rope of vision models
     mrope: bool,
     slots: Vec<Slot>,
@@ -110,6 +114,8 @@ impl Session {
             width: loaded.hparams.n_embd * loaded.model.streams,
             n_vocab: loaded.hparams.n_vocab,
             top: TOP.min(loaded.hparams.n_vocab.max(1)),
+            draft: false,
+            taps: Vec::new(),
             mrope: matches!(loaded.hparams.rope.kind, RopeKind::MRope | RopeKind::IMRope),
             slots: vec![Slot::default(); plan.n_seq.max(1)],
             graphs: HashMap::new(),
@@ -173,6 +179,11 @@ impl Session {
         self.backend.as_mut()
     }
 
+    /// The weights every pass reads, what a block started later needs
+    pub fn store(&self) -> Arc<Store> {
+        self.store.clone()
+    }
+
     pub fn backend_ref(&self) -> &dyn Backend {
         self.backend.as_ref()
     }
@@ -187,7 +198,7 @@ impl Session {
         let key = (hop, n_tokens, n_out, seg.inject);
         if !self.graphs.contains_key(&key) {
             let mut g = GraphBuilder::new();
-            let mut out = self.model.segment(&mut g, n_tokens, seg)?;
+            let mut out = self.model.segment(&mut g, n_tokens, seg, &self.taps)?;
             if seg.n_out.is_some() {
                 out = g.push(Op::TopK { k: self.top }, &[out]);
             }
@@ -317,9 +328,28 @@ impl Session {
         self.check(seq, tokens.len())?;
         let mut out = Vec::new();
         for chunk in tokens.chunks(self.n_batch) {
-            out = self.pass(&[(seq, Rows::Tokens(chunk))], 1)?;
+            let n_out = if self.draft { chunk.len() } else { 1 };
+            out = self.pass(&[(seq, Rows::Tokens(chunk))], n_out)?;
         }
         out.pop().ok_or_else(|| anyhow::anyhow!("the pass scored no row"))
+    }
+
+    /// Scores every row of every pass from now on, as the draft block needs to learn from and run ahead of them
+    pub fn set_draft(&mut self, on: bool) {
+        self.draft = on;
+    }
+
+    /// Keeps the residual rows after these layers through every pass from now on, the graphs rebuilt for it
+    pub fn set_taps(&mut self, taps: &[usize]) -> Result<()> {
+        let n = self.model.n_layers();
+        ensure!(taps.windows(2).all(|w| w[0] < w[1]) && taps.iter().all(|l| *l < n), "tap layers {taps:?} of a model of {n} layers in rising order");
+        self.taps = taps.to_vec();
+        self.graphs.clear();
+        Ok(())
+    }
+
+    pub fn taps(&self) -> &[usize] {
+        &self.taps
     }
 
     /// Feeds one slot's tokens in batch sized chunks and returns the candidates of every one, row by row

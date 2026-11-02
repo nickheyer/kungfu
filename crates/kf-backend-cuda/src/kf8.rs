@@ -334,19 +334,30 @@ impl Store {
 }
 
 /// The int8 activation scratch laid out in one float buffer of rows times n: the int8 rows, then the scales and integer
-/// sums per 16 columns, then per 32, every array sixteen byte aligned
-pub fn act_scratch_all(base: u64, rows: usize, n: usize) -> [u64; 5] {
+/// sums per 16 columns, then per 32, then the fragment array of docs/mm-frag.md, every array sixteen byte aligned
+pub fn act_scratch_all(base: u64, rows: usize, n: usize) -> [u64; 6] {
     let up = |x: u64| x.next_multiple_of(16);
     let q = base;
     let s16 = up(q + (rows * n) as u64);
     let m16 = up(s16 + (rows * n / 16 * 4) as u64);
     let s32 = up(m16 + (rows * n / 16 * 4) as u64);
     let m32 = up(s32 + (rows * n / 32 * 4) as u64);
-    [q, s16, m16, s32, m32]
+    let xa = up(m32 + (rows * n / 32 * 4) as u64);
+    [q, s16, m16, s32, m32, xa]
 }
+
+/// Bytes of the whole int8 activation scratch of rows of n, the fragment array included, under the four bytes per
+/// element every quantizing producer's buffer holds
+pub fn act_scratch_bytes(rows: usize, n: usize) -> usize {
+    let [.., xa] = act_scratch_all(0, rows, n);
+    xa as usize + rows * n / 256 * XA_ROW
+}
+
+/// Bytes of one row of one super block in the fragment array, KF_XA_ROW of the kernels
+pub const XA_ROW: usize = 280;
 
 /// The integers, scales, and sums a product over groups of g columns reads, g being 16 or 32
 pub fn act_scratch(base: u64, rows: usize, n: usize, g: usize) -> (u64, u64, u64) {
-    let [q, s16, m16, s32, m32] = act_scratch_all(base, rows, n);
+    let [q, s16, m16, s32, m32, _] = act_scratch_all(base, rows, n);
     if g == 16 { (q, s16, m16) } else { (q, s32, m32) }
 }

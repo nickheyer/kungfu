@@ -10,7 +10,7 @@ cache rows move down to where they would have stood fed one after another and ev
 
 A chain of drafts stands only while every token is right. A tree hedges the positions a drafter is unsure of with
 its next best tokens, so a wrong guess at depth one no longer ends the round, and a verify pass of sixteen rows costs
-1.9 decode steps, so the rows are cheap. Every drafter kungfu has, the ngram drafter and the learned head of
+1.3 decode steps through the fragment product of `docs/mm-frag.md`, so the rows are cheap. Every drafter kungfu has, the ngram drafter and the learned head of
 `docs/drafter.md`, proposes trees.
 
 ## The pass

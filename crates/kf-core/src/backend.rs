@@ -15,14 +15,8 @@ pub trait WeightSource: Send + Sync {
 /// Most rows a tree pass may hold, the keys one ancestor mask covers
 pub const TREE_ROWS: usize = 64;
 
-/// Consecutive rows one chunk of the draft head's training holds, the span its attention sees
-pub const HEAD_CHUNK: usize = 64;
-
-/// Scored rows the feature ring keeps for the draft head to learn from
-pub const FEATURE_RING_ROWS: usize = 16384;
-
-/// What one training step of the draft head reports: the loss before the update and the share of the batch's
-/// positions whose actual next token stood among the children the head's first depth would have drafted
+/// What one training step of the draft block reports: the mean loss before the update and the share of first step
+/// rows whose actual next token stood among the children the block would have drafted
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrainStep {
     pub loss: f32,
@@ -115,116 +109,6 @@ impl Tree {
     }
 }
 
-/// The shape and schedule of a draft head, one attention layer over the last window features with a gated MLP, which
-/// predicts the model's next residual row from the current one and the next token's embedding
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HeadConfig {
-    /// Width of the residual rows, the model's embedding width
-    pub d: usize,
-    pub heads: usize,
-    /// Width of the gated MLP
-    pub ff: usize,
-    /// Positions a row attends back over
-    pub window: usize,
-    pub eps: f32,
-    pub lr: f32,
-    pub weight_decay: f32,
-    pub seed: u64,
-}
-
-impl HeadConfig {
-    /// A head for a model of width d, heads of 128 when the width allows and sixteen heads otherwise, a gated MLP
-    /// twice as wide, a window of 64
-    pub fn for_width(d: usize) -> Self {
-        let heads = if d.is_multiple_of(128) { d / 128 } else { 16 };
-        Self { d, heads, ff: 2 * d, window: 64, eps: 1e-5, lr: 3e-4, weight_decay: 0.01, seed: 0x5eed }
-    }
-
-    pub fn head_dim(&self) -> usize {
-        self.d / self.heads
-    }
-
-    /// Device bytes the head takes to train and draft: parameters with their gradients and moments, the work of batch
-    /// chunks with the scoring of their predictions, the drafting rows and the windows of n_seq slots, the feature
-    /// ring, and the draft vocabulary's head rows
-    pub fn device_bytes(&self, batch: usize, n_seq: usize, ring_rows: usize, draft_vocab: usize) -> u64 {
-        let (d, ff, h, v) = (self.d as u64, self.ff as u64, self.heads as u64, draft_vocab as u64);
-        let (n, rows, chunk) = ((batch * HEAD_CHUNK) as u64, TREE_ROWS as u64, HEAD_CHUNK as u64);
-        let params = 4 * 4 * self.n_params() as u64;
-        let work = 4 * (23 * n * d + 6 * n * ff + batch as u64 * h * chunk * chunk);
-        let scoring = 4 * ((n + rows) * (v + d + 2 * TREE_ROWS as u64));
-        let draft = 4 * (14 * rows * d + 3 * rows * ff + 8 * rows * d.max(ff));
-        let windows = 4 * (n_seq as u64 * (2 * (self.window as u64 - 1) + 1) * d);
-        let ring = 4 * ring_rows as u64 * d;
-        let vocab = v * d * 2 + v * d / 32 * 4;
-        params + work + scoring + draft + windows + ring + vocab
-    }
-
-    /// Parameters of the head in order: fc of f and of e, q k v o, norm one, gate up down, norm two
-    pub fn param_shapes(&self) -> Vec<(&'static str, usize, usize)> {
-        let (d, ff) = (self.d, self.ff);
-        vec![("fc_f", d, d), ("fc_e", d, d), ("wq", d, d), ("wk", d, d), ("wv", d, d), ("wo", d, d), ("n1", 1, d), ("wg", d, ff), ("wu", d, ff), ("wd", ff, d), ("n2", 1, d)]
-    }
-
-    pub fn n_params(&self) -> usize {
-        self.param_shapes().iter().map(|(_, r, c)| r * c).sum()
-    }
-}
-
-/// The saved form of a head: a magic word, the configuration, the vocabulary, and every parameter in order, all little endian
-pub fn head_save(cfg: &HeadConfig, vocab: &[u32], params: &[Vec<f32>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"KFHEAD01");
-    for v in [cfg.d, cfg.heads, cfg.ff, cfg.window] {
-        out.extend_from_slice(&(v as u32).to_le_bytes());
-    }
-    out.extend_from_slice(&cfg.eps.to_le_bytes());
-    out.extend_from_slice(&(vocab.len() as u32).to_le_bytes());
-    for v in vocab {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out.extend_from_slice(&(params.len() as u32).to_le_bytes());
-    for p in params {
-        out.extend_from_slice(&(p.len() as u32).to_le_bytes());
-        for v in p {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    out
-}
-
-/// The configuration, vocabulary, and parameters of a saved head, checked against the configuration they load into
-pub fn head_load(cfg: &HeadConfig, bytes: &[u8]) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
-    use anyhow::{bail, ensure};
-    let mut at = 0usize;
-    let mut take = |n: usize| -> Result<&[u8]> {
-        ensure!(at + n <= bytes.len(), "a saved head of {} bytes ends early", bytes.len());
-        at += n;
-        Ok(&bytes[at - n..at])
-    };
-    let u32_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    if take(8)? != b"KFHEAD01" {
-        bail!("not a saved head");
-    }
-    let dims: Vec<usize> = (0..4).map(|_| take(4).map(|b| u32_of(b) as usize)).collect::<Result<_>>()?;
-    ensure!(dims == [cfg.d, cfg.heads, cfg.ff, cfg.window], "a saved head of shape {dims:?} for a head of {:?}", [cfg.d, cfg.heads, cfg.ff, cfg.window]);
-    let eps = f32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
-    ensure!(eps == cfg.eps, "a saved head with eps {eps} for a head with {}", cfg.eps);
-    let nv = u32_of(take(4)?) as usize;
-    let vocab: Vec<u32> = (0..nv).map(|_| take(4).map(u32_of)).collect::<Result<_>>()?;
-    let np = u32_of(take(4)?) as usize;
-    let shapes = cfg.param_shapes();
-    ensure!(np == shapes.len(), "a saved head of {np} parameter tensors for a head of {}", shapes.len());
-    let mut params = Vec::with_capacity(np);
-    for (_, r, c) in &shapes {
-        let n = u32_of(take(4)?) as usize;
-        ensure!(n == r * c, "a saved parameter of {n} values for a tensor of {} by {}", r, c);
-        let raw = take(4 * n)?;
-        params.push(raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect());
-    }
-    Ok((vocab, params))
-}
-
 /// What a pass feeds, token ids with their positions and sequence slots and, for a graph that starts mid model, the residual rows
 #[derive(Clone, Debug, Default)]
 pub struct Inputs {
@@ -275,6 +159,16 @@ impl Inputs {
         self.tree.get(row).copied()
     }
 
+    /// The parent of every tree row, the nearest earlier row its mask names, minus one for the root, a chain of
+    /// parents when the pass holds no tree
+    pub fn tree_parents(&self) -> Vec<i32> {
+        let n = self.tokens.len();
+        if self.tree.is_empty() {
+            return (0..n).map(|i| i as i32 - 1).collect();
+        }
+        (0..n).map(|i| (0..i).rev().find(|j| self.tree[i].sees((n - 1) as u32, *j as u32)).map_or(-1, |j| j as i32)).collect()
+    }
+
     /// The rotary streams of a row, the position in every stream when none were given
     pub fn rope_of(&self, row: usize) -> [u32; 4] {
         match self.rope.get(row) {
@@ -320,26 +214,35 @@ pub trait Backend: Send {
     fn dense_row(&mut self, row: usize) -> Result<Vec<f32>>;
     /// The residual rows before the final norm the last pass kept, one per row of logits, valid until the next pass
     fn hidden_rows(&mut self) -> Result<Vec<f32>>;
-    /// Starts the draft head over the model's embedding and head weights, learning from the rows every pass scores,
-    /// drafting over a vocabulary of the draft_vocab most frequent tokens, batch chunks a training step
-    fn drafter_start(&mut self, cfg: HeadConfig, embed: Wid, head: Wid, n_vocab: usize, draft_vocab: usize, batch: usize, weights: &dyn WeightSource) -> Result<()>;
-    /// One training step of the head on the rows scored so far, what it reports, none while too few rows stand
-    fn drafter_step(&mut self) -> Result<Option<TrainStep>>;
-    /// Rows the passes have handed the head so far, counting every row that entered its ring
-    fn drafter_rows(&self) -> u64;
-    /// Keeps the hidden row of the last pass at row for a slot's coming draft, the row's position given
-    fn drafter_hold(&mut self, seq: usize, row: usize, pos: u32) -> Result<()>;
-    /// Brings a slot's head state up to the rows the passes left for it
-    fn drafter_sync(&mut self, seq: usize) -> Result<()>;
-    /// A tree rooted at own, the token chosen after the held row of a slot, of at most budget rows, the root alone
-    /// while the head cannot draft for the slot
-    fn drafter_draft(&mut self, seq: usize, own: u32, budget: usize) -> Result<Tree>;
+    /// The residual rows after every tap layer the last pass kept, one row per kept hidden row with the taps side
+    /// by side in the graph's order, valid until the next pass
+    fn tap_rows(&mut self) -> Result<Vec<f32>>;
+    /// Starts collecting the layer statistics the tap selection reads from every pass over all n_layers tap rows
+    fn draft_calibrate(&mut self, n_layers: usize) -> Result<()>;
+    /// Rows the tap selection has kept so far
+    fn draft_calibrated(&self) -> u64;
+    /// The m layers the collected statistics select, by concatenated matrix entropy, the expansion pool by CKA
+    /// transition when cka is set, and ends the collection
+    fn draft_select_taps(&mut self, m: usize, cka: bool) -> Result<Vec<usize>>;
+    /// Starts the draft block over the model's embedding, head, and final norm weights with the tap layers the
+    /// passes keep, learning from the rows every pass scores, drafting over a vocabulary of the draft_vocab most
+    /// frequent tokens, batch chunks a training step, the end token left out of the rejection costs
+    #[allow(clippy::too_many_arguments)]
+    fn draft_start(&mut self, cfg: super::DraftConfig, tap_layers: &[usize], embed: Wid, head: Wid, norm: Wid, n_vocab: usize, eos: Option<u32>, draft_vocab: usize, batch: usize, weights: &dyn WeightSource) -> Result<()>;
+    /// One training step of the block on the rows scored so far, what it reports, none while too few rows stand
+    fn draft_step(&mut self) -> Result<Option<TrainStep>>;
+    /// Rows the passes have handed the block so far, counting every row that entered its ring
+    fn draft_rows(&self) -> u64;
+    /// Writes the step zero rows of the last pass's accepted path into the slot's history, the rows kept in order
+    /// and the root token picked at the last of them, and drafts a tree of up to rows below the root from the
+    /// block's own pass, the root alone when rows is one
+    fn draft_tree(&mut self, seq: usize, path: &[usize], root: u32, rows: usize) -> Result<Tree>;
     /// Recounts the draft vocabulary from the tokens the passes scored
-    fn drafter_refresh_vocab(&mut self) -> Result<()>;
-    /// The head's parameters and vocabulary as bytes another process of the same model loads
-    fn drafter_save(&mut self) -> Result<Vec<u8>>;
-    /// Replaces the head's parameters and vocabulary with saved ones
-    fn drafter_load(&mut self, bytes: &[u8]) -> Result<()>;
+    fn draft_refresh_vocab(&mut self) -> Result<()>;
+    /// The block's parameters and vocabulary as bytes another process of the same model loads
+    fn draft_save(&mut self) -> Result<Vec<u8>>;
+    /// Replaces the block's parameters and vocabulary with saved ones
+    fn draft_load(&mut self, bytes: &[u8]) -> Result<()>;
     /// Drops the state of one slot past its first n positions, an error when a recurrent state cannot roll back
     fn truncate(&mut self, seq: usize, n: usize) -> Result<()>;
     /// Moves the cache rows base plus keep[i] of one slot to base plus i for every layer and drops the rows past

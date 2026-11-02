@@ -1,5 +1,8 @@
 # The multi row product on native bytes, verify passes and small batches on the tensor cores
 
+Q4_K and Q6_K rows run the fragment product of `docs/mm-frag.md` instead, which reads the bytes in fragment order and
+costs 1.3 decode steps at sixteen rows. The product below serves the other block types.
+
 A product of 2 to 16 activation rows against a quantized weight reads each weight byte once, decodes it once, and
 multiplies it against every row through `mma.sync`, so a verify pass of k drafted tokens costs little more than one
 decode step. One kernel template serves every block type through the lane loaders the one row matvec already has.

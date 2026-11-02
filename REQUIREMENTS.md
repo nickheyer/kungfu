@@ -1,6 +1,47 @@
 # kungfu requirements
 
 Part 1 lists what the build is missing or wrong today, by crate, with the contract each piece must meet. Part 2 specifies the finished binary from nebu's side of the table, so nebu can install, plan, launch, watch, and form it like any other runtime, and better than the ones it has.
+All checks are in. The llama.cpp hits were unrelated uses of the words, so the absence list below is confirmed against its source on this machine.
+
+
+
+
+## Published, runtime-trained, no runtime has it
+
+1. Online head updates with dynamic-regret guarantees. When Drafts Evolve, March 2026: heads updated during serving, optimistic gradient step, a Hedge ensemble over learning rates, regret bounded by the square root of T times drift. Measured accepted length 1.52 to 2.94 on Llama-2-7B GSM8K and 1.78 to 2.70 on finance text. The loop kungfu runs is this paper's setting without its three mechanisms. Research code exists.
+2. On-policy distillation from the rows the ring drops. Draft-OPD replays drafting from the rejected positions with the target's own distribution as teacher, 23 percent over EAGLE-3 and 13 percent over DFlash. DVI turns accept and reject into a KL then policy-gradient schedule and reaches 2.16x with orders of magnitude less data. RCSD treats accepted and rejected sequences as preference pairs, 35 percent over HASS. All three need exactly the signal the ring discards. None has a runtime.
+3. A parallel block head trained in-process. One head read per round instead of four. EDR gives an objective that equals expected decode rounds for parallel drafters. BV loss adds 13 to 21 percent accepted on DFlash and DSpark. llama.cpp runs pre-trained ones and trains nothing.
+4. Better inputs and better targets. Features from several layers picked by matrix entropy and CKA instead of the one residual. AdaSPEC drops tokens the head cannot fit, 15 percent more acceptance, code released.
+5. No-regret drafter selection from one pass. HedgeSpec, ICLR 2026, scores every drafter from the same verify with no extra target queries. The scheduler's every-eighth-round probe is a bandit, and the paper shows full-information selection beats it by a margin that grows with drafter count.
+
+The order to do them follows the table. The int8 draft snapshot is engineering, has no research risk, and moves breakeven from 1.55 to 0.80. The ring change feeds items 1 and 2 at once. The block head is the structural move the objective papers were written for.
+
+Sources: When Drafts Evolve, Draft-OPD, DVI, RCSD, EDR, BV Loss, Activation Wave, AdaSPEC, HedgeSpec, MetaSD
+
+## Latest measurements of entropy
+
+**Lossless entropy coding of K-quants is dead on this model.** I computed the order-0 entropy of every tensor in the 1B file.
+
+| codes        | stored bits | measured entropy |
+| ------------ | ----------- | ---------------- |
+| Q4_K nibbles | 4           | 3.86             |
+| Q6_K codes   | 6           | 5.78             |
+| scale bytes  | 8           | 7.1 to 7.4       |
+| whole file   | 5.18 bpw    | 4.97 bpw         |
+
+The Shannon-bound papers report 2 to 10x headroom on naive int4. Group scales and mins already whiten these codes. The lossless cut here is 4 percent, a 1.04x.
+
+
+## Llama.CPP - Tools to beat by 5x-10x at minimum
+
+> Dont use `master` unless needed, use `4838ffb` since it's newer.
+
+1. ~/.local/share/nebu/builds/llamacpp/d4d11cea3159b906/out/llama-server # commit 4838ffb
+2. ~/.local/share/nebu/builds/llamacpp/d4d11cea3159b906/src/build/bin/llama-bench # and any other bin you'd need in that bin/ folder, commit 4838ffb
+3. ~/.local/share/nebu/builds/llamacpp/d2880b8096b82e2d/out/llama-server # master ...
+
+**What llama.cpp has versus lacks**, from its source tree here. It has draft-eagle3, draft-mtp, draft-dflash, draft-dspark, draft-simple and five ngram modes. It has no token recycling, no optimal-transport verification, no lattice or entropy-coded weight format, and no acceptance-trained objective.
+
 
 ## Part 1. Missing and broken
 

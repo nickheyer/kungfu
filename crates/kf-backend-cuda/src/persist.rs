@@ -356,7 +356,7 @@ fn struct_name(ty: &str) -> Result<&'static str> {
 /// The persistent kernel source for the quant types and head sizes of a pass, the quant kernel files pasted without
 /// their kernel entries so one translation unit holds every type
 fn compose(mv_types: &[String], embed_types: &[String], hds: &[usize]) -> Result<String> {
-    let mut src = String::from("#include \"quant.cuh\"\n#undef KF_QUANT_KERNELS_I8\n#define KF_QUANT_KERNELS_I8(T)\n#undef KF_QUANT_KERNELS\n#define KF_QUANT_KERNELS(T)\n");
+    let mut src = String::from("#include \"quant.cuh\"\n#undef KF_QUANT_KERNELS_I8\n#define KF_QUANT_KERNELS_I8(T)\n#undef KF_QUANT_KERNELS\n#define KF_QUANT_KERNELS(T)\n#undef KF_FRAG_KERNELS\n#define KF_FRAG_KERNELS(T)\n");
     // Blocks per SM the kernel is bound to, and further defines separated by bars, both for tuning
     if let Some(n) = std::env::var("KF_PERSIST_BLOCKS").ok().and_then(|v| v.parse::<u32>().ok()).filter(|n| *n >= 1) {
         src.push_str(&format!("#define KF_PS_BLOCKS {n}\n"));

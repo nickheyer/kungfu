@@ -13,7 +13,7 @@ extern "C" __global__ void quant_act(const float* x, i8* q, float* s16, float* m
     const int row = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int span = blockIdx.y * KF_QUANT_SPAN + warp * 256;
     if (span >= n) return;
-    const KfActRow o = kf_act_row(q, s16, m16, s32, m32, row, n);
+    const KfActRow o = kf_act_row(q, s16, m16, s32, m32, row, n, gridDim.x);
     const int c0 = span + lane * 8;
     float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (c0 < n) kf_load8(x + (i64)row * n + c0, v);
@@ -31,7 +31,7 @@ extern "C" __global__ void rms_norm_q8(const float* x, const float* w, const flo
     s = kf_block_sum(s, scratch);
     if (span >= n) return;
     const float inv = 1.0f / sqrtf(s / (float)n + eps);
-    const KfActRow o = kf_act_row(q, s16, m16, s32, m32, row, n);
+    const KfActRow o = kf_act_row(q, s16, m16, s32, m32, row, n, gridDim.x);
     const int c0 = span + lane * 8;
     float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (c0 < n) {
@@ -51,7 +51,7 @@ extern "C" __global__ void gated_act_q8(const float* gate, const float* up, int 
     const int row = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int span = blockIdx.y * KF_QUANT_SPAN + warp * 256;
     if (span >= n) return;
-    const KfActRow o = kf_act_row(q, s16, m16, s32, m32, row, n);
+    const KfActRow o = kf_act_row(q, s16, m16, s32, m32, row, n, gridDim.x);
     const int c0 = span + lane * 8;
     float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (c0 < n) {

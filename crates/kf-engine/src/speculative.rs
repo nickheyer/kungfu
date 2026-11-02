@@ -15,6 +15,14 @@ pub trait Drafter: Send {
 /// sampler with every rule a request adds
 pub type Chooser<'a> = dyn FnMut(&Candidates, &[u32], &mut dyn FnMut() -> Result<Vec<f32>>) -> Result<u32> + 'a;
 
+/// What a verify pass settled: the root and the accepted path's tokens plus the model's next token, and the rows of
+/// the tree the path ran through
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Verified {
+    pub tokens: Vec<u32>,
+    pub path: Vec<usize>,
+}
+
 /// Verifies a chain of drafted tokens of one slot in one pass given the token the sampler picked for the slot's next
 /// position, and returns the accepted prefix plus the model's next token
 pub fn verify(session: &mut Session, seq: usize, own: u32, drafted: &[u32], choose: &mut Chooser<'_>) -> Result<Vec<u32>> {
@@ -25,13 +33,13 @@ pub fn verify(session: &mut Session, seq: usize, own: u32, drafted: &[u32], choo
         return Ok(vec![own]);
     }
     let tree = Tree { tokens: drafted.to_vec(), parents: (0..drafted.len()).map(|i| i as i32 - 1).collect() };
-    verify_tree(session, seq, &tree, choose)
+    Ok(verify_tree(session, seq, &tree, choose)?.tokens)
 }
 
 /// Verifies a tree of drafted tokens of one slot in one pass. From the root, the chooser's own pick at each row stands
 /// when a child holds it and the walk moves to that child, else the pick ends the walk as the model's next token. The
 /// accepted path stays in the slot's cache and every other row leaves it. Returns the path's tokens plus the next token.
-pub fn verify_tree(session: &mut Session, seq: usize, tree: &Tree, choose: &mut Chooser<'_>) -> Result<Vec<u32>> {
+pub fn verify_tree(session: &mut Session, seq: usize, tree: &Tree, choose: &mut Chooser<'_>) -> Result<Verified> {
     ensure!(!tree.is_empty(), "nothing drafted");
     ensure!(tree.len() <= session.n_batch(), "{} drafted rows past a batch of {}", tree.len(), session.n_batch());
     let mut history = session.recent(seq).to_vec();
@@ -55,7 +63,7 @@ pub fn verify_tree(session: &mut Session, seq: usize, tree: &Tree, choose: &mut 
     };
     session.accept_path(seq, tree.len(), &path)?;
     accepted.push(next);
-    Ok(accepted)
+    Ok(Verified { tokens: accepted, path })
 }
 
 /// Three grams the shared table holds, a power of two

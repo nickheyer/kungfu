@@ -123,6 +123,13 @@ __device__ __forceinline__ void kf_cp_async16(u32 dst, const void* src, bool fil
 #endif
 }
 
+// Sixteen byte asynchronous copy of the first n source bytes into shared memory with the rest zero filled
+__device__ __forceinline__ void kf_cp_async16n(u32 dst, const void* src, int n) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(n));
+#endif
+}
+
 __device__ __forceinline__ void kf_cp_commit() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;");
@@ -183,22 +190,36 @@ __device__ __forceinline__ void kf_load8(const float* p, float* v) {
     v[7] = b.w;
 }
 
-// One row of the int8 activation scratch, the integers then scales and integer sums per 16 and per 32 columns
+// Bytes of one row of one super block in the fragment array
+#define KF_XA_ROW 280
+
+// One row of the int8 activation scratch with its tile of the fragment array behind the sums, see docs/mm-frag.md
 struct KfActRow {
     i8* q;
     float* s16;
     float* m16;
     float* s32;
     float* m32;
+    u8* xa;
+    int xa_rt, xa_gid;
 };
 
-__device__ __forceinline__ KfActRow kf_act_row(i8* q, float* s16, float* m16, float* s32, float* m32, int row, int n) {
+__device__ __forceinline__ KfActRow kf_act_row(i8* q, float* s16, float* m16, float* s32, float* m32, int row, int n, int rows) {
     KfActRow r;
     r.q = q + (i64)row * n;
     r.s16 = s16 + (i64)row * (n >> 4);
     r.m16 = m16 + (i64)row * (n >> 4);
     r.s32 = s32 + (i64)row * (n >> 5);
     r.m32 = m32 + (i64)row * (n >> 5);
+    r.xa = nullptr;
+    r.xa_rt = 0;
+    r.xa_gid = row & 7;
+    if (rows >= 2 && (n & 255) == 0) {
+        const size_t base = (reinterpret_cast<size_t>(m32) + (size_t)rows * (n >> 5) * 4 + 15) & ~(size_t)15;
+        const int t = row >> 3;
+        r.xa = reinterpret_cast<u8*>(base) + (size_t)t * (n >> 8) * 8 * KF_XA_ROW;
+        r.xa_rt = min(8, rows - 8 * t);
+    }
     return r;
 }
 
@@ -265,6 +286,17 @@ __device__ __forceinline__ void kf_quant_span(const float* v, int c0, int n, int
         u32 lo = (u32)(qi[0] & 0xff) | ((u32)(qi[1] & 0xff) << 8) | ((u32)(qi[2] & 0xff) << 16) | ((u32)(qi[3] & 0xff) << 24);
         u32 hi = (u32)(qi[4] & 0xff) | ((u32)(qi[5] & 0xff) << 8) | ((u32)(qi[6] & 0xff) << 16) | ((u32)(qi[7] & 0xff) << 24);
         *reinterpret_cast<uint2*>(o.q + c0) = make_uint2(lo, hi);
+        if (o.xa) {
+            const int sb = c0 >> 8, g = (c0 >> 5) & 7, tig = (c0 >> 3) & 3;
+            u8* blk = o.xa + (size_t)sb * o.xa_rt * KF_XA_ROW;
+            *reinterpret_cast<uint2*>(blk + (g * o.xa_rt + o.xa_gid) * 32 + tig * 8) = make_uint2(lo, hi);
+            if ((lane & 3) == 0) {
+                u8* sums = blk + o.xa_rt * 256 + o.xa_gid * 16;
+                sums[g] = (u8)(sum32 & 0xff);
+                sums[8 + g] = (u8)((sum32 >> 8) & 0xff);
+            }
+            if ((c0 & 255) == 0) *reinterpret_cast<float*>(blk + o.xa_rt * 272 + o.xa_gid * 4) = d;
+        }
         if ((lane & 1) == 0) {
             o.s16[c0 >> 4] = d;
             o.m16[c0 >> 4] = (float)sum16;

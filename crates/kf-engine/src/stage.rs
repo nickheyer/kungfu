@@ -229,7 +229,7 @@ impl StageRunner {
     fn graph(&mut self, n_tokens: usize) -> Result<Arc<Graph>> {
         if !self.graphs.contains_key(&n_tokens) {
             let mut g = GraphBuilder::new();
-            let out = self.model.segment(&mut g, n_tokens, Segment { from: self.from, to: self.to, embed: false, inject: false, n_out: None })?;
+            let out = self.model.segment(&mut g, n_tokens, Segment { from: self.from, to: self.to, embed: false, inject: false, n_out: None }, &[])?;
             self.graphs.insert(n_tokens, Arc::new(g.finish(out)));
         }
         Ok(self.graphs[&n_tokens].clone())

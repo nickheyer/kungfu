@@ -16,7 +16,7 @@ pub use plan::{CTX_MIN, CTX_STEP, LayerBytes, PlanDoc, PlacementDoc, PoolDoc, Re
 pub use sampler::{Candidates, Rng, Sampling, sample, sample_sparse};
 pub use session::{Rows, Session, tree_depths};
 pub use stage::{Link, StageConn, StageRunner, admitted, serve_stage};
-pub use speculative::{Chooser, Drafter, NGRAM_TOPS, Ngram, Tree, verify, verify_tree};
+pub use speculative::{Chooser, Drafter, NGRAM_TOPS, Ngram, Tree, Verified, verify, verify_tree};
 
 use anyhow::{Result, bail};
 use kf_core::Backend;

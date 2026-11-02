@@ -14,8 +14,6 @@ struct Setup {
 
 const N: usize = 96;
 
-/// Columns of the table's rows, the width every hidden row of these graphs has
-const N_EMBD_TABLE: usize = N;
 
 fn setup(seed: u64) -> Setup {
     let mut rng = Rng(seed);
@@ -361,38 +359,4 @@ fn kept_hidden_rows_survive_the_pass() {
     s.gpu.run(&kept, &inp, &s.w).expect("cuda kept");
     assert_close("hidden rows cpu", &s.cpu.hidden_rows().expect("cpu hidden"), &want, 1e-5);
     assert_close("hidden rows cuda", &s.gpu.hidden_rows().expect("cuda hidden"), &want, 1e-5);
-}
-
-/// The ring pairs rows of one slot at neighbouring positions and never across a rollback, each holding the pass's hidden row
-#[test]
-fn feature_ring_pairs_rows_within_an_epoch() {
-    let mut s = setup(44);
-    s.gpu.start_ring(N_EMBD_TABLE).expect("ring");
-    let mut g = GraphBuilder::new();
-    let tokens = g.input("tokens");
-    let x = g.push(Op::Embed { weight: s.table }, &[tokens]);
-    let y = g.push(Op::RmsNorm { weight: None, bias: None, eps: 1e-5 }, &[x]);
-    g.keep_hidden(x);
-    let graph = g.finish(y);
-    let mut hidden = Vec::new();
-    for (toks, start) in [(&TOKS[..4], 0u32), (&TOKS[4..5], 4), (&TOKS[1..3], 5)] {
-        s.gpu.run(&graph, &inputs(toks, start), &s.w).expect("cuda");
-        hidden.push(s.gpu.hidden_rows().expect("hidden"));
-    }
-    s.gpu.truncate(0, 3).expect("truncate");
-    s.gpu.run(&graph, &inputs(&TOKS[2..5], 3), &s.w).expect("cuda");
-    hidden.push(s.gpu.hidden_rows().expect("hidden"));
-    let ring = s.gpu.ring.as_ref().expect("ring");
-    assert_eq!(ring.count, 10);
-    let mut pairs = ring.pairs();
-    pairs.sort_unstable();
-    // Rows 0 to 6 ran positions 0 to 6 before the rollback, rows 7 to 9 positions 3 to 5 after it
-    assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 8), (8, 9)]);
-    assert_eq!((ring.entry(4).pos, ring.entry(4).token, ring.entry(7).pos, ring.entry(7).epoch), (4, TOKS[4], 3, 1));
-    let rows = kf_backend_cuda::features::ring_rows(&mut s.gpu, &[0, 4, 7, 9]).expect("rows");
-    let cols = N_EMBD_TABLE;
-    assert_eq!((rows.len(), hidden[0].len(), hidden[1].len(), hidden[3].len()), (4 * cols, 4 * cols, cols, 3 * cols));
-    for (k, want) in [&hidden[0][..cols], &hidden[1][..cols], &hidden[3][..cols], &hidden[3][2 * cols..3 * cols]].iter().enumerate() {
-        assert_eq!(&rows[k * cols..(k + 1) * cols], *want, "gathered ring row {k}");
-    }
 }

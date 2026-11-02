@@ -1,6 +1,6 @@
 //! Reference backend, every op in plain f32 on the host, the parity oracle for every other backend
 pub mod attention;
-pub mod drafter;
+pub mod draft;
 pub mod experts;
 pub mod hyper;
 pub mod moe;
@@ -10,7 +10,7 @@ pub mod rope;
 pub mod sparse;
 pub mod train;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use kf_core::{AllocKind, Backend, Graph, Inputs, Op, Plan, Pool, WeightSource, Wid};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -200,10 +200,24 @@ pub struct CpuBackend {
     dense: Option<Buf>,
     /// The residual rows before the final norm the last pass kept
     hidden: Option<Buf>,
-    /// The draft head, once started
-    drafter: Option<drafter::CpuDrafter>,
-    /// The slot and token of every row of the last tree pass, which compaction hands the drafter along the kept path
-    tree_tokens: Vec<(u32, u32)>,
+    /// The residual rows after every tap layer the last pass kept, in the graph's order
+    taps: Vec<Buf>,
+    /// Layer statistics the tap selection collects, while it does
+    cal: Option<draft::Calibration>,
+    /// The draft block, once started
+    draft: Option<draft::HostDraft>,
+}
+
+/// The tap rows of n rows side by side, every buffer's row r after the one before it
+fn tap_rows_of(taps: &[Buf], n: usize) -> Vec<f32> {
+    let width: usize = taps.iter().map(|b| b.cols).sum();
+    let mut out = Vec::with_capacity(n * width);
+    for r in 0..n {
+        for b in taps {
+            out.extend_from_slice(b.row(r));
+        }
+    }
+    out
 }
 
 impl Default for CpuBackend {
@@ -213,8 +227,53 @@ impl Default for CpuBackend {
 }
 
 impl CpuBackend {
+    /// The draft block once started, what parity tests read the block's distributions from
+    pub fn draft_block(&self) -> Option<&draft::HostDraft> {
+        self.draft.as_ref()
+    }
+
+    pub fn draft_block_mut(&mut self) -> Option<&mut draft::HostDraft> {
+        self.draft.as_mut()
+    }
+
+    /// Keeps the first n positions of one slot's state, the drafter untouched
+    fn trim(&mut self, seq: usize, n: usize) -> Result<()> {
+        let Some(s) = self.seqs.get_mut(seq) else { bail!("sequence slot {seq} of {}", self.seqs.len()) };
+        if n == 0 {
+            self.reset_seq(seq);
+            return Ok(());
+        }
+        let past = s.tokens.len();
+        if n >= past {
+            return Ok(());
+        }
+        for st in s.layers.values_mut() {
+            if let Some(kv) = &mut st.kv
+                && kv.n > n
+            {
+                kv.n = n;
+            }
+            let ratio = st.indexer_ratio.max(1);
+            if st.indexer.rows > n / ratio {
+                st.indexer.rows = n / ratio;
+                st.indexer.data.truncate(st.indexer.rows * st.indexer.cols);
+            }
+            for c in st.compressed.values_mut() {
+                let keep = c.rows.min(n / ratio);
+                c.rows = keep;
+                c.data.truncate(keep * c.cols);
+            }
+            if st.has_recurrent() {
+                recurrent::roll_back(st, past, n)?;
+            }
+        }
+        s.tokens.truncate(n);
+        Ok(())
+    }
+
+
     pub fn new() -> Self {
-        Self { seqs: vec![SeqState::default()], cur: 0, small: HashMap::new(), n_ctx: 0, n_batch: 0, state_bytes: 0, dense: None, hidden: None, drafter: None, tree_tokens: Vec::new() }
+        Self { seqs: vec![SeqState::default()], cur: 0, small: HashMap::new(), n_ctx: 0, n_batch: 0, state_bytes: 0, dense: None, hidden: None, taps: Vec::new(), cal: None, draft: None }
     }
 
     /// Sizes every cache made from now on for a context length and a largest pass, with the slots given
@@ -426,18 +485,25 @@ impl Backend for CpuBackend {
         let topk = g.nodes.iter().find(|n| n.out == out).filter(|n| matches!(n.op, Op::TopK { .. })).map(|n| n.inputs[0]);
         self.dense = topk.and_then(|tid| t[tid.0 as usize].take());
         self.hidden = g.hidden.and_then(|tid| t.get(tid.0 as usize).cloned().flatten());
-        if let (Some(h), Some(d)) = (self.hidden.as_ref(), self.drafter.as_mut()) {
-            let n = inputs.tokens.len();
-            let first = n - h.rows.min(n);
-            if inputs.tree.is_empty() {
-                for (k, r) in (first..n).enumerate() {
-                    d.append(inputs.seq_of(r), inputs.positions[r], inputs.tokens[r], h.row(k).to_vec());
-                }
-            } else {
-                self.tree_tokens = (first..n).map(|r| (inputs.seq_of(r) as u32, inputs.tokens[r])).collect();
+        self.taps = g.taps.iter().filter_map(|tid| t.get(tid.0 as usize).cloned().flatten()).collect();
+        let data = t[out.0 as usize].take().ok_or_else(|| anyhow!("tensor {} used before it was computed", out.0))?;
+        let n = inputs.tokens.len();
+        if let (Some(cal), Some(dense), Some(_)) = (self.cal.as_mut(), self.dense.as_ref(), topk) {
+            ensure!(self.taps.len() == cal.n_layers && self.taps.iter().all(|b| b.rows == n) && dense.rows == n, "the tap selection needs every layer's rows of every pass scored, {} tap tensors for {} layers", self.taps.len(), cal.n_layers);
+            cal.observe(&tap_rows_of(&self.taps, n), &dense.data, n, dense.cols);
+        }
+        if let (Some(d), Some(_)) = (self.draft.as_mut(), topk) {
+            ensure!(!self.taps.is_empty() && self.taps.iter().all(|b| b.rows == n) && data.rows == n, "the draft block needs every row of a pass scored with its tap rows, {} tap tensors and {} candidate rows for {n} tokens", self.taps.len(), data.rows);
+            let taps = tap_rows_of(&self.taps, n);
+            let width = taps.len() / n.max(1);
+            let parents = inputs.tree_parents();
+            for (seq, range) in inputs.runs() {
+                let rows: Vec<kf_core::Scored> = range.clone().map(|r| Ok(kf_core::Scored { seq: seq as u32, pos: inputs.positions[r], token: inputs.tokens[r], taps: taps[r * width..(r + 1) * width].to_vec(), soft: kf_core::Soft::from_packed(data.row(r))? })).collect::<Result<_>>()?;
+                let local: Vec<i32> = parents[range.clone()].iter().map(|p| if *p < 0 { -1 } else { *p - range.start as i32 }).collect();
+                d.pass(seq, rows, &local, !inputs.tree.is_empty())?;
             }
         }
-        Ok(t[out.0 as usize].take().ok_or_else(|| anyhow!("tensor {} used before it was computed", out.0))?.data)
+        Ok(data.data)
     }
 
     fn dense_row(&mut self, row: usize) -> Result<Vec<f32>> {
@@ -452,62 +518,60 @@ impl Backend for CpuBackend {
         Ok(self.hidden.as_ref().ok_or_else(|| anyhow!("the last pass kept no hidden rows"))?.data.clone())
     }
 
-    fn drafter_start(&mut self, cfg: kf_core::HeadConfig, embed: Wid, head: Wid, n_vocab: usize, draft_vocab: usize, batch: usize, weights: &dyn WeightSource) -> Result<()> {
+    fn tap_rows(&mut self) -> Result<Vec<f32>> {
+        ensure!(!self.taps.is_empty(), "the last pass kept no tap rows");
+        Ok(tap_rows_of(&self.taps, self.taps[0].rows))
+    }
+
+    fn draft_calibrate(&mut self, n_layers: usize) -> Result<()> {
+        ensure!(n_layers >= 1, "a tap selection over no layers");
+        self.cal = Some(draft::Calibration::new(n_layers));
+        Ok(())
+    }
+
+    fn draft_calibrated(&self) -> u64 {
+        self.cal.as_ref().map_or(0, |c| c.retained)
+    }
+
+    fn draft_select_taps(&mut self, m: usize, cka: bool) -> Result<Vec<usize>> {
+        let cal = self.cal.take().ok_or_else(|| anyhow!("no tap statistics were collected"))?;
+        ensure!(cal.retained >= kf_core::DRAFT_CAL_BLOCK as u64, "{} rows kept for the tap selection, at least {} are needed", cal.retained, kf_core::DRAFT_CAL_BLOCK);
+        Ok(cal.select(m, cka))
+    }
+
+    fn draft_start(&mut self, cfg: kf_core::DraftConfig, tap_layers: &[usize], embed: Wid, head: Wid, norm: Wid, n_vocab: usize, eos: Option<u32>, draft_vocab: usize, batch: usize, weights: &dyn WeightSource) -> Result<()> {
         let embd = dequant_all(embed, weights)?;
         let rows = if head == embed { embd.clone() } else { dequant_all(head, weights)? };
-        self.drafter = Some(drafter::CpuDrafter::new(cfg, self.seqs.len(), embd, rows, n_vocab, draft_vocab, batch, 16384)?);
+        let norm = dequant_all(norm, weights)?;
+        self.draft = Some(draft::HostDraft::new(cfg, tap_layers.to_vec(), self.seqs.len(), embd, rows, norm, n_vocab, draft_vocab, batch, eos)?);
         Ok(())
     }
 
-    fn drafter_step(&mut self) -> Result<Option<kf_core::TrainStep>> {
-        Ok(self.drafter.as_mut().and_then(|d| d.step(kf_core::HEAD_CHUNK)))
-    }
-
-    fn drafter_rows(&self) -> u64 {
-        self.drafter.as_ref().map_or(0, |d| d.appended)
-    }
-
-    fn drafter_hold(&mut self, seq: usize, row: usize, pos: u32) -> Result<()> {
-        let h = self.hidden.as_ref().ok_or_else(|| anyhow!("the last pass kept no hidden rows"))?;
-        if row >= h.rows {
-            bail!("row {row} of {} hidden rows", h.rows);
+    fn draft_step(&mut self) -> Result<Option<kf_core::TrainStep>> {
+        match self.draft.as_mut() {
+            Some(d) => d.step(),
+            None => Ok(None),
         }
-        let feat = h.row(row).to_vec();
-        if let Some(d) = self.drafter.as_mut() {
-            d.hold(seq, feat, pos);
-        }
-        Ok(())
     }
 
-    fn drafter_sync(&mut self, seq: usize) -> Result<()> {
-        if let Some(d) = self.drafter.as_mut() {
-            d.sync(seq);
-        }
-        Ok(())
+    fn draft_rows(&self) -> u64 {
+        self.draft.as_ref().map_or(0, |d| d.ring.appended())
     }
 
-    fn drafter_draft(&mut self, seq: usize, own: u32, budget: usize) -> Result<kf_core::Tree> {
-        Ok(self.drafter.as_ref().map_or_else(|| kf_core::Tree::root(own), |d| d.draft(seq, own, budget)))
+    fn draft_tree(&mut self, seq: usize, path: &[usize], root: u32, rows: usize) -> Result<kf_core::Tree> {
+        self.draft.as_mut().ok_or_else(|| anyhow!("no draft block"))?.draft_tree(seq, path, root, rows)
     }
 
-    fn drafter_refresh_vocab(&mut self) -> Result<()> {
-        if let Some(d) = self.drafter.as_mut() {
-            d.refresh_vocab();
-        }
-        Ok(())
+    fn draft_refresh_vocab(&mut self) -> Result<()> {
+        self.draft.as_mut().ok_or_else(|| anyhow!("no draft block"))?.refresh_vocab()
     }
 
-    fn drafter_save(&mut self) -> Result<Vec<u8>> {
-        let d = self.drafter.as_ref().ok_or_else(|| anyhow!("no draft head to save"))?;
-        Ok(kf_core::head_save(&d.head.cfg, &d.vocab, &d.head.params))
+    fn draft_save(&mut self) -> Result<Vec<u8>> {
+        Ok(self.draft.as_ref().ok_or_else(|| anyhow!("no draft block to save"))?.save())
     }
 
-    fn drafter_load(&mut self, bytes: &[u8]) -> Result<()> {
-        let d = self.drafter.as_mut().ok_or_else(|| anyhow!("no draft head to load into"))?;
-        let (vocab, params) = kf_core::head_load(&d.head.cfg, bytes)?;
-        d.head = drafter::CpuHead::with_params(d.head.cfg, params)?;
-        d.vocab = vocab;
-        Ok(())
+    fn draft_load(&mut self, bytes: &[u8]) -> Result<()> {
+        self.draft.as_mut().ok_or_else(|| anyhow!("no draft block to load into"))?.load(bytes)
     }
 
     fn compact(&mut self, seq: usize, base: usize, keep: &[usize]) -> Result<()> {
@@ -532,17 +596,11 @@ impl Backend for CpuBackend {
             }
         }
         let kept: Vec<u32> = keep.iter().filter_map(|k| s.tokens.get(base + k).copied()).collect();
-        if let (Some(h), Some(d)) = (self.hidden.as_ref(), self.drafter.as_mut())
-            && self.tree_tokens.len() == h.rows
-        {
-            let tokens = std::mem::take(&mut self.tree_tokens);
-            for (i, k) in keep.iter().enumerate() {
-                if let Some((_, token)) = tokens.get(*k) {
-                    d.append(seq, (base + i) as u32, *token, h.row(*k).to_vec());
-                }
-            }
+        if let Some(d) = self.draft.as_mut() {
+            d.compacted(seq, base, keep);
         }
-        kf_core::Backend::truncate(self, seq, base + keep.len())?;
+        // The kept path continues the sequence, so the state trims to it without the drafter rolling back
+        self.trim(seq, base + keep.len())?;
         let Some(s) = self.seqs.get_mut(seq) else { bail!("sequence slot {seq} of {}", self.seqs.len()) };
         for (i, t) in kept.into_iter().enumerate() {
             if let Some(slot) = s.tokens.get_mut(base + i) {
@@ -553,45 +611,15 @@ impl Backend for CpuBackend {
     }
 
     fn truncate(&mut self, seq: usize, n: usize) -> Result<()> {
-        if let Some(d) = self.drafter.as_mut() {
+        if let Some(d) = self.draft.as_mut() {
             d.roll_back(seq);
         }
-        let Some(s) = self.seqs.get_mut(seq) else { bail!("sequence slot {seq} of {}", self.seqs.len()) };
-        if n == 0 {
-            self.reset_seq(seq);
-            return Ok(());
-        }
-        let past = s.tokens.len();
-        if n >= past {
-            return Ok(());
-        }
-        for st in s.layers.values_mut() {
-            if let Some(kv) = &mut st.kv
-                && kv.n > n
-            {
-                kv.n = n;
-            }
-            let ratio = st.indexer_ratio.max(1);
-            if st.indexer.rows > n / ratio {
-                st.indexer.rows = n / ratio;
-                st.indexer.data.truncate(st.indexer.rows * st.indexer.cols);
-            }
-            for c in st.compressed.values_mut() {
-                let keep = c.rows.min(n / ratio);
-                c.rows = keep;
-                c.data.truncate(keep * c.cols);
-            }
-            if st.has_recurrent() {
-                recurrent::roll_back(st, past, n)?;
-            }
-        }
-        s.tokens.truncate(n);
-        Ok(())
+        self.trim(seq, n)
     }
 
     fn reset(&mut self) {
         for seq in 0..self.seqs.len() {
-            if let Some(d) = self.drafter.as_mut() {
+            if let Some(d) = self.draft.as_mut() {
                 d.roll_back(seq);
             }
         }
@@ -603,7 +631,7 @@ impl Backend for CpuBackend {
     }
 
     fn reset_seq(&mut self, seq: usize) {
-        if let Some(d) = self.drafter.as_mut() {
+        if let Some(d) = self.draft.as_mut() {
             d.roll_back(seq);
         }
         if let Some(s) = self.seqs.get_mut(seq) {
@@ -617,7 +645,7 @@ impl Backend for CpuBackend {
     }
 
     fn load_state(&mut self, seq: usize, bytes: &[u8]) -> Result<()> {
-        if let Some(d) = self.drafter.as_mut() {
+        if let Some(d) = self.draft.as_mut() {
             d.roll_back(seq);
         }
         self.restore(seq, SavedState::from_bytes(bytes)?)

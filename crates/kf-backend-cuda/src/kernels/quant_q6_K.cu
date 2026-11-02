@@ -83,4 +83,50 @@ struct KfQw<Q6K, 64> {
     }
 };
 
+// Fragment plan of 210 byte super blocks in 240 byte windows with 16 wide groups of signed centred values per byte scale
+template <>
+struct KfFrag<Q6K> {
+    static constexpr int PITCH = 240, PIECES = 15, STAGES = 2, WARPS = 4, KSTEP = 16, GPC = 8;
+    static constexpr bool HAS_MIN = false;
+    struct Hdr {
+        float d;
+        u32 s[4];
+    };
+    static __device__ __forceinline__ void header(const u8* row, Hdr& h) {
+        h.d = kf_h2f(*reinterpret_cast<const u16*>(row + 208));
+#pragma unroll
+        for (int i = 0; i < 4; i++) h.s[i] = kf_frag_word(row + 192 + 4 * i);
+    }
+    // Signed scale byte g of the sixteen, the groups running in column order
+    static __device__ __forceinline__ int scale(const Hdr& h, int g) {
+        return (int)(i8)((h.s[g >> 2] >> (8 * (g & 3))) & 0xffu);
+    }
+    static __device__ __forceinline__ u32 min_frag(const Hdr&, int) {
+        return 0u;
+    }
+    // Half j of the block, four low words and two high words per row giving its eight groups of sixteen
+    static __device__ __forceinline__ void chunk(const u8* r0, const u8* r1, int tig, int j, u32 a[8][2]) {
+        u32 lw[2][2][2], hw[2][2];
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const u8* b = (r == 0 ? r0 : r1) + 4 * tig;
+#pragma unroll
+            for (int k1 = 0; k1 < 2; k1++) {
+#pragma unroll
+                for (int l = 0; l < 2; l++) lw[r][k1][l] = kf_frag_word(b + 64 * j + 32 * k1 + 16 * l);
+            }
+#pragma unroll
+            for (int l = 0; l < 2; l++) hw[r][l] = kf_frag_word(b + 128 + 32 * j + 16 * l);
+        }
+        const u32 m4 = 0x0f0f0f0fu, m2 = 0x03030303u, c32 = 0x20202020u;
+#pragma unroll
+        for (int gg = 0; gg < 8; gg++) {
+            const int k = gg >> 1, l = gg & 1, lsh = (k >> 1) * 4, hsh = 2 * k;
+#pragma unroll
+            for (int r = 0; r < 2; r++) a[gg][r] = __vsub4(((lw[r][k & 1][l] >> lsh) & m4) | (((hw[r][l] >> hsh) & m2) << 4), c32);
+        }
+    }
+};
+
 KF_QUANT_KERNELS_I8(Q6K)
+KF_FRAG_KERNELS(Q6K)

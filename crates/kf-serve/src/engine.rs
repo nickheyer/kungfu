@@ -1,7 +1,7 @@
 //! The scheduler thread that owns the session, admitting requests to slots and decoding every active slot in one pass
 use crate::api::Metrics;
 use crate::grammar::Constraint;
-use crate::head::{Head, Source};
+use crate::head::{Arm, CAL_ROWS, Calibrating, DRAFT_VOCAB, Head, Measure, Source, TRAIN_BATCH};
 use crate::tokenizer::Tok;
 use kf_vision::{Clip, ImageInput};
 use anyhow::{Result, anyhow, bail, ensure};
@@ -84,6 +84,18 @@ pub struct Job {
 
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
+
+/// What one round drafts: the tree verified and who drafted it, the arm the hedge played among the awake arms,
+/// the block's, the ngram's, and the union's trees as drafted for the round's measurement, and whether the
+/// request's room cut any of them
+struct Proposal {
+    tree: Tree,
+    source: Source,
+    arm: Option<Arm>,
+    awake: [bool; 4],
+    trees: [Option<Tree>; 3],
+    cut: bool,
+}
 
 /// What the sampler picked from one row, with the whole row when the pick needed it
 pub struct Pick {
@@ -254,9 +266,10 @@ pub struct Engine {
 
 impl Engine {
     /// Starts the scheduler thread over a session and hands back its handle
-    pub fn start(session: Session, tok: Arc<Tok>, draft: Option<DraftConn>, spec: Option<(Ngram, usize)>, head: Option<Head>, vision: Option<Arc<Clip>>, metrics: Arc<Metrics>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn start(session: Session, tok: Arc<Tok>, draft: Option<DraftConn>, spec: Option<(Ngram, usize)>, head: Option<Head>, cal: Option<Calibrating>, vision: Option<Arc<Clip>>, metrics: Arc<Metrics>) -> Self {
         let (tx, rx) = chan::channel();
-        let handle = std::thread::Builder::new().name("kungfu-engine".into()).spawn(move || run(session, tok, draft, spec, head, vision, metrics, rx)).expect("engine thread");
+        let handle = std::thread::Builder::new().name("kungfu-engine".into()).spawn(move || run(session, tok, draft, spec, head, cal, vision, metrics, rx)).expect("engine thread");
         Self { tx: Arc::new(Mutex::new(Some(tx))), handle: Arc::new(Mutex::new(Some(handle))) }
     }
 
@@ -314,6 +327,10 @@ struct Active {
     logits: Option<Candidates>,
     /// What the last row settled before any further pass, see settle_all
     pre: Option<Pre>,
+    /// The row of the slot's last pass the drafts for the next round hang from, the accepted leaf of a tree pass
+    leaf: usize,
+    /// The rows of the slot's last pass the block carries into its history, the accepted path of a tree pass
+    path: Vec<usize>,
     out: Vec<u32>,
     text: String,
     sent: usize,
@@ -341,6 +358,8 @@ struct Active {
     lp_sent: usize,
     /// Log probabilities of the verified tokens still waiting in pending, in their order
     lp_pending: VecDeque<TokenLogprob>,
+    /// The slot's rounds whose measurement still walks an arm's tree, oldest first
+    measures: Vec<Measure>,
 }
 
 /// What a job's last row of logits decided while the row was still on the backend
@@ -349,6 +368,8 @@ enum Pre {
     Own(Option<u32>, Option<TokenLogprob>),
     /// The log probability entry of the forced token at the front
     Forced(Option<TokenLogprob>),
+    /// The model's own token at the leaf of the last verify pass, already emitted, which the next tree is rooted at
+    Root(u32),
 }
 
 struct Scheduler {
@@ -357,8 +378,10 @@ struct Scheduler {
     draft: Option<DraftConn>,
     /// The ngram drafter with its longest draft, when no draft seat proposes
     spec: Option<(Ngram, usize)>,
-    /// The learned head's schedule and measures, when the backend trains one
+    /// The learned block's schedule and measures, when the backend trains one
     head: Option<Head>,
+    /// The block's tap selection in progress, the block starting once the first scored rows chose its layers
+    cal: Option<Calibrating>,
     vision: Option<Arc<Clip>>,
     metrics: Arc<Metrics>,
     waiting: VecDeque<Job>,
@@ -370,9 +393,9 @@ struct Scheduler {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(session: Session, tok: Arc<Tok>, draft: Option<DraftConn>, spec: Option<(Ngram, usize)>, head: Option<Head>, vision: Option<Arc<Clip>>, metrics: Arc<Metrics>, rx: chan::Receiver<Cmd>) {
+fn run(session: Session, tok: Arc<Tok>, draft: Option<DraftConn>, spec: Option<(Ngram, usize)>, head: Option<Head>, cal: Option<Calibrating>, vision: Option<Arc<Clip>>, metrics: Arc<Metrics>, rx: chan::Receiver<Cmd>) {
     let think_close = tok.encode(&format!("{THINK_CLOSE}\n"), false).unwrap_or_default();
-    let mut s = Scheduler { session, tok, draft, spec, head, vision, metrics, waiting: VecDeque::new(), active: Vec::new(), think_close, decode_secs: 0.0 };
+    let mut s = Scheduler { session, tok, draft, spec, head, cal, vision, metrics, waiting: VecDeque::new(), active: Vec::new(), think_close, decode_secs: 0.0 };
     loop {
         if s.active.is_empty() && s.waiting.is_empty() {
             // Idle, the head trains on the rows it has earned between commands, then the thread waits for one
@@ -519,7 +542,7 @@ impl Scheduler {
                         }
                         None => 0,
                     };
-                    self.active.push(Active { job, slot, t0, prefill_done: None, cached, fed: cached, logits: None, pre: None, out: Vec::new(), text: String::new(), sent: 0, rng: Rng::new(seed), pending: VecDeque::new(), forced: VecDeque::new(), rounds: 0, accepted: 0, passes: 0, head_rounds: 0, spec_len, next: None, finish: None, stop_sequence: None, constraint, think_open, think_count: 0, lp: Vec::new(), lp_sent: 0, lp_pending: VecDeque::new() });
+                    self.active.push(Active { job, slot, t0, prefill_done: None, cached, fed: cached, logits: None, pre: None, leaf: 0, path: vec![0], out: Vec::new(), text: String::new(), sent: 0, rng: Rng::new(seed), pending: VecDeque::new(), forced: VecDeque::new(), rounds: 0, accepted: 0, passes: 0, head_rounds: 0, spec_len, next: None, finish: None, stop_sequence: None, constraint, think_open, think_count: 0, lp: Vec::new(), lp_sent: 0, lp_pending: VecDeque::new(), measures: Vec::new() });
                 }
                 Err(e) => {
                     let _ = job.tx.blocking_send(Piece::Failed(format!("{e:#}")));
@@ -587,10 +610,8 @@ impl Scheduler {
                 if done {
                     a.logits = logits;
                     a.prefill_done = Some(Instant::now());
-                }
-                // The prompt's last row is what the head drafts the first round from
-                if done {
-                    self.hold(slot, 0);
+                    a.leaf = 0;
+                    a.path = vec![0];
                 }
             }
             Err(e) => {
@@ -624,7 +645,8 @@ impl Scheduler {
         }
     }
 
-    /// One job's decision from its last row, the row consumed
+    /// One job's decision from its last row, the row consumed, its distribution walking the slot's open measurements
+    /// at the position the decided token commits
     fn settle(&mut self, i: usize) -> Result<()> {
         let a = &mut self.active[i];
         let want = a.job.logprobs;
@@ -640,6 +662,7 @@ impl Scheduler {
         if let Some(&t) = a.forced.front() {
             let entry = want.map(|n| logprob_entry(&c, None, t, n, &mut fetch)).transpose()?;
             a.pre = Some(Pre::Forced(entry));
+            self.commit(i, &c, t);
             return Ok(());
         }
         let first = a.out.is_empty();
@@ -655,6 +678,9 @@ impl Scheduler {
             }
         }
         a.pre = Some(Pre::Own(pick.token, entry));
+        if let Some(t) = pick.token {
+            self.commit(i, &c, t);
+        }
         Ok(())
     }
 
@@ -683,91 +709,180 @@ impl Scheduler {
         }
     }
 
-    /// The tree drafted after the job's context from its own token and who drafted it: the draft seat as a chain, the
-    /// learned head with the context's repeats grafted in, or the ngram drafter, the head's measure choosing between
-    /// the last two, within the request's room, the root alone when nothing fits
-    fn drafted(&mut self, i: usize, own: u32) -> Result<(Tree, Source)> {
-        let (slot, spec_len, room) = {
+    /// The tree drafted after the job's context from its own token and who drafted it: the draft seat as a chain,
+    /// or the arm the block's hedge plays among the block's tree, the ngram drafter's, both grafted together, and
+    /// plain decoding, every arm's tree kept for the round's measurement, within the request's room
+    fn drafted(&mut self, i: usize, own: u32) -> Result<Proposal> {
+        let (slot, spec_len, room, path) = {
             let a = &self.active[i];
-            (a.slot, a.spec_len, (a.job.limits.max_tokens - a.out.len()).saturating_sub(1).max(1))
+            (a.slot, a.spec_len, (a.job.limits.max_tokens - a.out.len()).saturating_sub(1).max(1), a.path.clone())
+        };
+        let limit = room.min(self.session.n_ctx().saturating_sub(self.session.n_past(slot))).min(self.session.n_batch()).max(1);
+        let fit = |mut tree: Tree| {
+            if tree.len() > limit {
+                tree.tokens.truncate(limit);
+                tree.parents.truncate(limit);
+            }
+            tree
         };
         let mut context = text_tail(&self.active[i].job.chunks);
         context.extend_from_slice(&self.active[i].out);
-        let mut source = match (&self.draft, &self.spec, &mut self.head) {
-            (Some(_), _, _) => Source::Seat,
-            (None, spec, Some(h)) => h.source(spec.is_some(), self.decode_secs),
-            (None, Some(_), None) => Source::Ngram,
-            (None, None, None) => Source::None,
-        };
-        let mut tree = match source {
-            Source::Seat => {
-                let d = self.draft.as_ref().ok_or_else(|| anyhow!("no draft seat"))?;
-                context.push(own);
-                let mut tree = Tree::root(own);
-                let mut parent = 0;
-                for t in d.draft(&context)? {
-                    match tree.push(parent, t) {
-                        Some(row) => parent = row,
-                        None => break,
-                    }
+        if let Some(d) = &self.draft {
+            context.push(own);
+            let mut tree = Tree::root(own);
+            let mut parent = 0;
+            for t in d.draft(&context)? {
+                match tree.push(parent, t) {
+                    Some(row) => parent = row,
+                    None => break,
                 }
-                tree
             }
-            Source::Head => {
-                let rows = self.head.as_ref().map_or(0, |h| h.rows);
-                let backend = self.session.backend_mut();
-                backend.drafter_sync(slot)?;
-                let mut tree = backend.drafter_draft(slot, own, rows)?;
-                match &self.spec {
-                    // A slot the head holds no row for yet leaves the round to the ngram drafter
-                    Some((ng, _)) if tree.len() == 1 => {
-                        source = Source::Ngram;
-                        tree = ng.draft(&context, own, spec_len + 1);
-                    }
-                    Some((ng, _)) => {
-                        context.push(own);
-                        tree.graft(&ng.chain(&context, spec_len), rows + spec_len);
-                    }
-                    None => {}
-                }
-                tree
-            }
-            Source::Ngram => self.spec.as_ref().map_or_else(|| Tree::root(own), |(ng, _)| ng.draft(&context, own, spec_len + 1)),
-            Source::None => Tree::root(own),
+            let tree = fit(tree);
+            let source = if tree.len() > 1 { Source::Seat } else { Source::None };
+            return Ok(Proposal { tree, source, arm: None, awake: [false, false, false, true], trees: [None, None, None], cut: false });
+        }
+        let rows = self.head.as_ref().map_or(0, |h| h.rows);
+        let warm = self.head.as_ref().is_some_and(|h| h.warm());
+        // The block's pass carries the accepted path into its history every round and drafts once it is warm
+        let head = match &self.head {
+            Some(_) => Some(self.session.backend_mut().draft_tree(slot, &path, own, if warm { rows.max(1) } else { 1 })?),
+            None => None,
         };
-        if tree.len() == 1 {
-            source = Source::None;
+        let ngram = self.spec.as_ref().map(|(ng, _)| ng.draft(&context, own, spec_len + 1));
+        context.push(own);
+        let union = match (&head, &self.spec) {
+            (Some(h), Some((ng, _))) if h.len() > 1 => {
+                let mut t = h.clone();
+                t.graft(&ng.chain(&context, spec_len), rows + spec_len);
+                Some(t)
+            }
+            _ => None,
+        };
+        let ngram_on = self.spec.is_some();
+        let (arm, awake) = match &self.head {
+            Some(h) => (Some(h.arm(ngram_on)), h.awake(ngram_on)),
+            None => (None, [false, ngram_on, false, true]),
+        };
+        let (tree, source) = match arm {
+            Some(Arm::Head) => (head.clone().unwrap_or_else(|| Tree::root(own)), Source::Head),
+            Some(Arm::Ngram) | None => (ngram.clone().unwrap_or_else(|| Tree::root(own)), Source::Ngram),
+            Some(Arm::Union) => (union.clone().unwrap_or_else(|| Tree::root(own)), Source::Union),
+            Some(Arm::Plain) => (Tree::root(own), Source::None),
+        };
+        let cut = [&head, &ngram, &union].iter().any(|t| t.as_ref().is_some_and(|t| t.len() > limit));
+        let tree = fit(tree);
+        let source = if tree.len() > 1 { source } else { Source::None };
+        if std::env::var_os("KF_DRAFT_TRACE").is_some() {
+            eprintln!("drafted: arm {arm:?} warm {warm} rows {rows} spec_len {spec_len} limit {limit} cut {cut} head {:?} ngram {:?} union {:?} path {path:?}", head.as_ref().map(|t| t.len()), ngram.as_ref().map(|t| t.len()), union.as_ref().map(|t| t.len()));
         }
-        // Rows past the room, the context, or the batch go, children before parents never since rows are pushed in order
-        let limit = room.min(self.session.n_ctx().saturating_sub(self.session.n_past(slot))).min(self.session.n_batch());
-        if tree.len() > limit {
-            tree.tokens.truncate(limit.max(1));
-            tree.parents.truncate(limit.max(1));
-        }
-        Ok((tree, source))
+        Ok(Proposal { tree, source, arm, awake, trees: [head, ngram, union], cut })
     }
 
     /// One token for job i, forced from a spent think budget, verified from a draft round, or the sampler's own
     fn pick(&mut self, i: usize) -> Result<()> {
-        let slot = self.active[i].slot;
-        let pre = self.active[i].pre.take();
+        let mut pre = self.active[i].pre.take();
+        // A root already emitted heads a tree of its own, or goes back to a plain pass when nothing was drafted below it
+        if let Some(Pre::Root(root)) = pre {
+            let p = self.drafted(i, root)?;
+            if p.tree.len() == 1 {
+                self.plain_round(i, p);
+                self.active[i].next = Some(root);
+                return Ok(());
+            }
+            self.round(i, p, None, true)?;
+            pre = None;
+        }
+        // The draft seat's chain is verified below the sampler's own token, the block and the ngram drafter drafting
+        // once the token is emitted and rooted
         if let Some(Pre::Own(Some(own), entry)) = &pre
             && self.active[i].pending.is_empty()
-            && (self.draft.is_some() || self.spec.is_some() || self.head.is_some())
+            && self.draft.is_some()
         {
             let own = *own;
-            let t0 = Instant::now();
-            let (drafted, source) = self.drafted(i, own)?;
-            let n_drafted = drafted.len() - 1;
-            let a = &mut self.active[i];
-            a.rounds += 1;
-            if n_drafted > 0 {
+            let p = self.drafted(i, own)?;
+            if p.tree.len() > 1 {
+                self.round(i, p, entry.clone(), false)?;
+            } else {
+                let a = &mut self.active[i];
+                a.rounds += 1;
+                if let Some(e) = entry {
+                    a.lp_pending.push_back(e.clone());
+                }
+                a.pending.push_back(own);
+            }
+        }
+        self.emit(i, pre)
+    }
+
+    /// Counts a round that verifies nothing below its root, one token for one decode pass, and opens its arm's
+    /// measurement when the room cut no arm's tree, walked from the decode pass's own distribution on
+    fn plain_round(&mut self, i: usize, p: Proposal) {
+        let a = &mut self.active[i];
+        a.rounds += 1;
+        if let Some(arm) = p.arm
+            && !p.cut
+            && self.head.is_some()
+        {
+            a.measures.push(Measure::new(arm, self.decode_secs, p.awake, p.trees));
+        }
+    }
+
+    /// Takes the model's distribution at job i's next committed position with the token committed there into the
+    /// slot's open measurements, each complete one observed by the block and reported
+    fn commit(&mut self, i: usize, c: &Candidates, token: u32) {
+        let most = self.most();
+        let a = &mut self.active[i];
+        if a.measures.is_empty() {
+            return;
+        }
+        let prob = |tok: u32| c.logprob(tok).map_or(0.0, f32::exp);
+        for m in &mut a.measures {
+            m.advance(&prob, token);
+        }
+        let Some(h) = self.head.as_mut() else {
+            a.measures.clear();
+            return;
+        };
+        let mut k = 0;
+        while k < a.measures.len() {
+            if !a.measures[k].done() {
+                k += 1;
+                continue;
+            }
+            let m = a.measures.remove(k);
+            h.observe(m.arm, m.secs, &m.taus(), &m.awake, self.decode_secs, most);
+            let (rates, weights) = (h.rates(), h.hedge.weights());
+            for arm in Arm::ALL {
+                self.metrics.rate[arm.index()].store(rates[arm.index()].to_bits(), Ordering::Relaxed);
+                self.metrics.weight[arm.index()].store((weights[arm.index()] as f32).to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The most tokens one round could yield, the block's rows with the ngram chain and the bonus token
+    fn most(&self) -> usize {
+        self.head.as_ref().map_or(0, |h| h.rows) + self.spec.as_ref().map_or(0, |(_, m)| *m) + 1
+    }
+
+    /// One verify pass of a drafted tree for job i: the sampler walks the rows, the accepted tokens join the pending
+    /// queue, the root left out when it was emitted already, the accepted path becomes the rows the next draft
+    /// hangs from, and the pass's distributions walk the slot's measurements, the round's own opened first
+    fn round(&mut self, i: usize, p: Proposal, entry: Option<TokenLogprob>, rooted: bool) -> Result<()> {
+        let slot = self.active[i].slot;
+        let t0 = Instant::now();
+        let drafted = p.tree;
+        let source = p.source;
+        let n_drafted = drafted.len() - 1;
+        let a = &mut self.active[i];
+        a.rounds += 1;
+        {
                 let tok = self.tok.clone();
                 let eos = tok.eos.first().copied().unwrap_or(0);
                 let mut con = a.constraint.clone();
                 let want = a.job.logprobs;
                 let mut lps: Vec<TokenLogprob> = entry.iter().cloned().collect();
                 let mut tops: Vec<(u32, Vec<u32>)> = Vec::new();
+                let mut dists: Vec<Candidates> = Vec::new();
                 let (sampling, bias, rng) = (&a.job.sampling, &a.job.limits.bias, &mut a.rng);
                 let mut chooser = |c: &Candidates, recent: &[u32], dense: &mut dyn FnMut() -> Result<Vec<f32>>| -> Result<u32> {
                     let pick = choose(c, dense, sampling, recent, rng, bias, &mut con, &tok, false)?;
@@ -778,17 +893,22 @@ impl Scheduler {
                     if let Some(&last) = recent.last() {
                         tops.push((last, c.ids[..NGRAM_TOPS.min(c.len())].to_vec()));
                     }
+                    dists.push(c.clone());
                     Ok(t)
                 };
-                let accepted = kf_engine::verify_tree(&mut self.session, slot, &drafted, &mut chooser)?;
+                let verified = kf_engine::verify_tree(&mut self.session, slot, &drafted, &mut chooser)?;
+                let accepted = verified.tokens;
                 let taken = accepted.len() - 1;
                 a.accepted += taken as u64;
                 a.passes += (taken > 0) as u64;
                 a.head_rounds += (source == Source::Head) as u64;
                 if want.is_some() {
-                    ensure!(lps.len() == accepted.len(), "{} log probabilities for {} verified tokens", lps.len(), accepted.len());
+                    ensure!(lps.len() + rooted as usize == accepted.len(), "{} log probabilities for {} verified tokens", lps.len(), accepted.len());
                     a.lp_pending.extend(lps);
                 }
+                a.leaf = *verified.path.last().ok_or_else(|| anyhow!("an empty accepted path"))?;
+                a.path = verified.path.clone();
+                let a = &mut self.active[i];
                 if let Some((ng, max)) = &mut self.spec {
                     // The drafter learns the verified tokens in their context and the model's favourites after each, and
                     // its draft length follows the acceptance of the rounds it drafted
@@ -804,27 +924,32 @@ impl Scheduler {
                         a.spec_len = if taken == n_drafted { (a.spec_len + 1).min(*max) } else if taken == 0 { 1 } else { taken.max(1) };
                     }
                 }
-                a.pending.extend(accepted);
+                // What the round committed after its root, the model's distribution known at every position
+                let committed: Vec<u32> = accepted[1..].to_vec();
+                a.pending.extend(accepted.into_iter().skip(rooted as usize));
                 a.constraint = con;
-                // The round's yield over its time, the decode pass that gave own included, measures its drafter
-                let secs = self.decode_secs + t0.elapsed().as_secs_f32();
-                if let Some(h) = self.head.as_mut() {
-                    h.observe(source, taken, secs);
-                    let (head, ngram) = h.rates();
-                    self.metrics.rate_head.store(head.to_bits(), Ordering::Relaxed);
-                    self.metrics.rate_ngram.store(ngram.to_bits(), Ordering::Relaxed);
+                // The verify pass's seconds measure its arm, its measurement opened when the room cut no arm's tree,
+                // and every distribution the pass scored walks the slot's open measurements in position order
+                if let Some(arm) = p.arm
+                    && !p.cut
+                    && self.head.is_some()
+                {
+                    a.measures.push(Measure::new(arm, t0.elapsed().as_secs_f32(), p.awake, p.trees));
+                }
+                for (c, t) in dists.iter().zip(&committed) {
+                    self.commit(i, c, *t);
                 }
                 if let Some(k) = source.index() {
                     self.metrics.draft_rounds[k].fetch_add(1, Ordering::Relaxed);
                     self.metrics.draft_accepted[k].fetch_add(taken as u64, Ordering::Relaxed);
                 }
-            } else {
-                if let Some(e) = entry {
-                    a.lp_pending.push_back(e.clone());
-                }
-                a.pending.push_back(own);
-            }
         }
+        Ok(())
+    }
+
+    /// Emits job i's next token from the forced front, the pending verified tokens, or the sampler's own, and sets up
+    /// what the next pass feeds
+    fn emit(&mut self, i: usize, pre: Option<Pre>) -> Result<()> {
         let a = &mut self.active[i];
         let first = a.out.is_empty();
         let want = a.job.logprobs;
@@ -850,6 +975,7 @@ impl Scheduler {
                 entry = e;
                 t
             }
+            Some(Pre::Root(_)) => bail!("a root token reached emission a second time"),
             None => bail!("a job picked with nothing settled and nothing pending"),
         };
         a.logits = None;
@@ -901,7 +1027,12 @@ impl Scheduler {
             return Ok(());
         }
         if a.pending.is_empty() {
-            a.next = Some(next);
+            // With drafts standing below the leaf the next tree is rooted here, else the plain pass feeds the token
+            if self.head.is_some() || self.spec.is_some() {
+                a.pre = Some(Pre::Root(next));
+            } else {
+                a.next = Some(next);
+            }
         }
         Ok(())
     }
@@ -917,11 +1048,12 @@ impl Scheduler {
             Ok(rows) => {
                 let secs = t0.elapsed().as_secs_f32();
                 self.decode_secs = if self.decode_secs == 0.0 { secs } else { self.decode_secs + (secs - self.decode_secs) / 16.0 };
-                for (i, ((slot, _), row)) in batch.iter().zip(rows).enumerate() {
-                    self.hold(*slot, i);
+                for ((slot, _), row) in batch.iter().zip(rows) {
                     if let Some(a) = self.active.iter_mut().find(|a| a.slot == *slot) {
                         a.logits = Some(row);
                         a.next = None;
+                        a.leaf = 0;
+                        a.path = vec![0];
                     }
                 }
                 if let Some(h) = self.head.as_mut() {
@@ -937,28 +1069,39 @@ impl Scheduler {
         }
     }
 
-    /// Keeps a slot's hidden row of the pass just run for the head's next draft from that slot
-    fn hold(&mut self, slot: usize, row: usize) {
-        if self.head.is_none() {
+    /// Starts the block once the tap selection has kept enough rows: the layers chosen, the passes rebuilt to keep
+    /// them, and the block started over them
+    fn calibrate(&mut self) {
+        if self.cal.as_ref().is_none_or(|_| self.session.backend_ref().draft_calibrated() < CAL_ROWS) {
             return;
         }
-        let pos = self.session.n_past(slot).saturating_sub(1) as u32;
-        if let Err(e) = self.session.backend_mut().drafter_hold(slot, row, pos) {
-            event::error("drafter", &[("detail", format!("{e:#}"))]);
+        let Some(c) = self.cal.take() else { return };
+        let started = (|| -> Result<Head> {
+            let taps = self.session.backend_mut().draft_select_taps(c.cfg.taps, c.cka)?;
+            self.session.set_taps(&taps)?;
+            let store = self.session.store();
+            self.session.backend_mut().draft_start(c.cfg, &taps, c.embed, c.head, c.norm, c.n_vocab, c.eos, DRAFT_VOCAB.min(c.n_vocab), TRAIN_BATCH, store.as_ref())?;
+            event::emit("drafter", &[("taps", format!("{taps:?}")), ("layers", c.n_layers.to_string()), ("params", c.cfg.n_params().to_string()), ("rows", c.rows.to_string())]);
+            Ok(Head::new(c.rows, taps, c.cfg.depth, c.dir.clone(), c.model.clone(), c.cfg.d, c.n_vocab))
+        })();
+        match started {
+            Ok(h) => self.head = Some(h),
+            Err(e) => event::error("drafter", &[("detail", format!("{e:#}"))]),
         }
     }
 
-    /// One training step of the head when one is due, with the vocabulary recount and the save it brings, true when
-    /// a step ran
+    /// One training step of the block when one is due, with the vocabulary recount and the save it brings, true when
+    /// a step ran, the block started first once its tap selection is done
     fn train(&mut self, idle: bool) -> bool {
+        self.calibrate();
         let Some(h) = self.head.as_mut() else { return false };
-        h.earn(self.session.backend_ref().drafter_rows());
+        h.earn(self.session.backend_ref().draft_rows());
         if !h.due(idle, self.decode_secs) {
             return false;
         }
         let t0 = Instant::now();
         let backend = self.session.backend_mut();
-        let step = match backend.drafter_step() {
+        let step = match backend.draft_step() {
             Ok(Some(step)) => step,
             Ok(None) => return false,
             Err(e) => {
@@ -972,7 +1115,7 @@ impl Scheduler {
         self.metrics.head_loss.store(h.loss.to_bits(), Ordering::Relaxed);
         self.metrics.head_hit.store(h.hit.to_bits(), Ordering::Relaxed);
         if h.vocab_due()
-            && let Err(e) = backend.drafter_refresh_vocab()
+            && let Err(e) = backend.draft_refresh_vocab()
         {
             event::error("drafter", &[("detail", format!("{e:#}"))]);
         }

@@ -79,9 +79,18 @@ pub static PARAMS: &[Param] = &[
     Param { unit: "tokens", min: 1.0, max: 64.0, step: 1.0, advanced: true, ..p("draft_max", Kind::Int, "4", "Speculative decoding", "--draft-max", "Draft tokens per round", "tokens a draft seat or the ngram drafter proposes per round") },
     Param { choices: SPECULATE, advanced: true, ..p("speculate", Kind::String, "auto", "Speculative decoding", "--speculate", "Speculation", "head drafts a tree from the head the server teaches itself on the rows it scores, the context's repeats grafted in, and measures it against the ngram drafter round by round, ngram drafts from the context's repeats alone, auto is head on a device and ngram on the cpu, off decodes one token per pass") },
     Param { unit: "rows", min: 2.0, max: 64.0, step: 1.0, advanced: true, ..p("head_rows", Kind::Int, "16", "Speculative decoding", "--head-rows", "Head tree rows", "rows of the tree the learned head drafts for one verify pass") },
+    Param { unit: "positions", min: 2.0, max: 8.0, step: 1.0, advanced: true, ..p("head_depth", Kind::Int, "5", "Speculative decoding", "--head-depth", "Head positions", "positions the learned head drafts in one pass, its root row and the mask rows after it") },
+    Param { unit: "layers", min: 1.0, max: 4.0, step: 1.0, advanced: true, ..p("head_taps", Kind::Int, "3", "Speculative decoding", "--head-taps", "Head tap layers", "layers whose residual rows the learned head fuses, chosen by matrix entropy over the first scored rows") },
+    Param { unit: "learners", min: 1.0, max: 4.0, step: 1.0, advanced: true, ..p("head_learners", Kind::Int, "3", "Speculative decoding", "--head-learners", "Head learners", "most learners the head trains side by side at rates spread by factors of two, fewer when the device lacks room, drafting from their hedged mixture") },
+    Param { choices: HEAD_LOSS, advanced: true, ..p("head_loss", Kind::String, "edr", "Speculative decoding", "--head-loss", "Head objective", "edr minimizes the expected decoding rounds, bv the log of the expected accepted length under block verification, ce the cross entropy at every position") },
+    Param { choices: HEAD_SELECT, advanced: true, ..p("head_select", Kind::String, "elsi", "Speculative decoding", "--head-select", "Head tap selection", "elsi expands the tap layer set by concatenated matrix entropy, elsi_c draws its expansion pool from the layers of highest CKA transition") },
 ];
 
 pub const SPECULATE: &[&str] = &["auto", "head", "ngram", "off"];
+
+pub const HEAD_LOSS: &[&str] = &["edr", "bv", "ce"];
+
+pub const HEAD_SELECT: &[&str] = &["elsi", "elsi_c"];
 
 pub const ROLES: &[&str] = &["head", "replica", "stage", "prefill", "decode", "draft"];
 
@@ -221,6 +230,11 @@ pub struct Seat {
     pub draft_max: usize,
     pub speculate: String,
     pub head_rows: usize,
+    pub head_depth: usize,
+    pub head_taps: usize,
+    pub head_learners: usize,
+    pub head_loss: String,
+    pub head_select: String,
 }
 
 /// Everything a launch needs, typed from the table's values
@@ -280,6 +294,11 @@ impl Launch {
             draft_max: v("draft_max").int("draft_max")? as usize,
             speculate: v("speculate").str("speculate").to_string(),
             head_rows: v("head_rows").int("head_rows")? as usize,
+            head_depth: v("head_depth").int("head_depth")? as usize,
+            head_taps: v("head_taps").int("head_taps")? as usize,
+            head_learners: v("head_learners").int("head_learners")? as usize,
+            head_loss: v("head_loss").str("head_loss").to_string(),
+            head_select: v("head_select").str("head_select").to_string(),
         };
         let launch = Self {
             model,

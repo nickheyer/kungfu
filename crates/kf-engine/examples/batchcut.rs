@@ -20,7 +20,7 @@ fn main() -> Result<()> {
             let mut s = Session::new(&loaded, p.backend, &p.plan);
             s.feed(0, &prompt)?;
             let mut g = GraphBuilder::new();
-            let full = loaded.model.segment(&mut g, toks.len(), Segment { from: 0, to: n_layers, embed: true, inject: false, n_out: Some(toks.len()) })?;
+            let full = loaded.model.segment(&mut g, toks.len(), Segment { from: 0, to: n_layers, embed: true, inject: false, n_out: Some(toks.len()) }, &[])?;
             let (graph, label) = match cut.strip_prefix("n:") {
                 Some(k) => {
                     let k: usize = k.parse()?;

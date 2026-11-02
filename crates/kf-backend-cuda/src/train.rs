@@ -134,12 +134,6 @@ pub fn adamw(b: &mut CudaBackend, p: u64, g: u64, m: u64, v: u64, n: usize, lr: 
     launch(b, "adamw", (grid_for(n), 1, 1), 256, vec![P(p), P(g), P(m), P(v), L(n as i64), F(lr), F(b1), F(b2), F(eps), F(wd), I(t)])
 }
 
-/// The mean smooth L1 loss added into loss, one float, and the gradient of the mean into grad
-pub fn smooth_l1(b: &mut CudaBackend, pred: u64, target: u64, grad: u64, loss: u64, n: usize, beta: f32) -> Result<()> {
-    use Arg::{F, L, P};
-    launch(b, "smooth_l1", (grid_for(n).min(1024), 1, 1), 256, vec![P(pred), P(target), P(grad), P(loss), L(n as i64), F(beta)])
-}
-
 /// y += alpha x over n values
 pub fn axpy(b: &mut CudaBackend, x: u64, y: u64, n: usize, alpha: f32) -> Result<()> {
     use Arg::{F, L, P};
@@ -158,43 +152,148 @@ pub fn gather_rows_h(b: &mut CudaBackend, src: u64, idx: u64, dst: u64, rows: us
     launch(b, "gather_rows_h", (grid_for(rows * cols), 1, 1), 256, vec![P(src), P(idx), P(dst), I(rows as i32), I(cols as i32)])
 }
 
-/// Chunk length of the head's attention, KF_TA_T of train.cu
-pub const ATTN_T: usize = kf_core::HEAD_CHUNK;
+/// Chunk length of the block's training attention, KF_TA_T of train.cu
+pub const ATTN_T: usize = kf_core::DRAFT_CHUNK;
 
-/// Shared memory of the head's attention kernels for a head size
-fn attn_smem(hd: usize) -> u32 {
-    ((2 * ATTN_T * hd + ATTN_T * ATTN_T) * 4) as u32
+/// Ancestors a draft row may list, KF_DA_ANC of train.cu, a path of every tree row with the mask rows after it
+pub const DRAFT_ANCESTORS: usize = 80;
+
+/// Candidates a packed row holds for the soft target loss, KF_SOFT_K of train.cu
+pub const SOFT_K: usize = kf_core::DRAFT_CANDS;
+
+/// Shared memory of the chained attention kernels for a chain length and head size
+fn chain_smem(hd: usize, chain: usize) -> u32 {
+    ((2 * ATTN_T * hd + ATTN_T * (ATTN_T + chain)) * 4) as u32
 }
 
-/// Attention of the head over b chunks of ATTN_T positions and h heads of hd, every position seeing the keys at or before it within
-/// the window, the probabilities kept for the backward pass
+/// Attention of one query group at drafted step `step` over b chunks of ATTN_T rows and h heads of hd, every row
+/// sees the window keys kwin and vwin at or before it within the window, strictly before it when self_key is
+/// false, and its own row at every chain step first to step, the chain keys and values of step m lying m times
+/// stepstride floats into k and v, the probabilities kept as [b, h, T, T + chain] for the backward pass
 #[allow(clippy::too_many_arguments)]
-pub fn head_attn_fwd(b: &mut CudaBackend, q: u64, k: u64, v: u64, out: u64, probs: u64, batch: usize, h: usize, hd: usize, window: usize, scale: f32) -> Result<()> {
-    use Arg::{F, I, P};
-    let smem = attn_smem(hd);
-    let func = b.kernels.function_smem("train", "head_attn_fwd", smem)?;
-    Launch { func, grid: ((batch * h) as u32, 1, 1), block: 256, smem, args: vec![P(q), P(k), P(v), P(out), P(probs), I(ATTN_T as i32), I(h as i32), I(hd as i32), I(window as i32), F(scale)] }.run(&b.stream)
+pub fn chain_attn_fwd(b: &mut CudaBackend, q: u64, k: u64, v: u64, stepstride: usize, step: usize, kwin: u64, vwin: u64, first: usize, self_key: bool, out: u64, probs: u64, batch: usize, h: usize, hd: usize, window: usize, scale: f32) -> Result<()> {
+    use Arg::{F, I, L, P};
+    ensure!(first <= step + 1, "a chain from step {first} to {step}");
+    let smem = chain_smem(hd, step + 1 - first);
+    let func = b.kernels.function_smem("train", "chain_attn_fwd", smem)?;
+    Launch { func, grid: ((batch * h) as u32, 1, 1), block: 256, smem, args: vec![P(q), P(k), P(v), L(stepstride as i64), I(step as i32), P(kwin), P(vwin), I(first as i32), I(self_key as i32), P(out), P(probs), I(ATTN_T as i32), I(h as i32), I(hd as i32), I(window as i32), F(scale)] }.run(&b.stream)
 }
 
-/// Gradients of the head's attention given dout and the kept probabilities
+/// Gradients of chain_attn_fwd given dout and the kept probabilities, the window keys' gradients added into dkwin
+/// and dvwin and the chain rows' into every step's rows of dk and dv
 #[allow(clippy::too_many_arguments)]
-pub fn head_attn_bwd(b: &mut CudaBackend, q: u64, k: u64, v: u64, probs: u64, dout: u64, dq: u64, dk: u64, dv: u64, batch: usize, h: usize, hd: usize, scale: f32) -> Result<()> {
-    use Arg::{F, I, P};
-    let smem = attn_smem(hd);
-    let func = b.kernels.function_smem("train", "head_attn_bwd", smem)?;
-    Launch { func, grid: ((batch * h) as u32, 1, 1), block: 256, smem, args: vec![P(q), P(k), P(v), P(probs), P(dout), P(dq), P(dk), P(dv), I(ATTN_T as i32), I(h as i32), I(hd as i32), F(scale)] }.run(&b.stream)
+pub fn chain_attn_bwd(b: &mut CudaBackend, q: u64, k: u64, v: u64, stepstride: usize, step: usize, kwin: u64, vwin: u64, first: usize, probs: u64, dout: u64, dq: u64, dk: u64, dv: u64, dkwin: u64, dvwin: u64, batch: usize, h: usize, hd: usize, scale: f32) -> Result<()> {
+    use Arg::{F, I, L, P};
+    ensure!(first <= step + 1, "a chain from step {first} to {step}");
+    let smem = chain_smem(hd, step + 1 - first);
+    let func = b.kernels.function_smem("train", "chain_attn_bwd", smem)?;
+    Launch { func, grid: ((batch * h) as u32, 1, 1), block: 256, smem, args: vec![P(q), P(k), P(v), L(stepstride as i64), I(step as i32), P(kwin), P(vwin), I(first as i32), P(probs), P(dout), P(dq), P(dk), P(dv), P(dkwin), P(dvwin), I(ATTN_T as i32), I(h as i32), I(hd as i32), F(scale)] }.run(&b.stream)
 }
 
-/// Ancestors a draft row may list, KF_TD_ANC of train.cu
-pub const DRAFT_ANCESTORS: usize = 8;
-
-/// Attention of m draft rows over their slot's window of nwin cached keys and values and their listed ancestors
+/// Attention of m draft rows over a slot's history ring of cap rows with their positions, the node rows their
+/// ancestor lists name, and themselves, see draft_attn in train.cu
 #[allow(clippy::too_many_arguments)]
-pub fn head_attn_draft(b: &mut CudaBackend, q: u64, kwin: u64, vwin: u64, nwin: usize, kanc: u64, vanc: u64, anc: u64, out: u64, m: usize, h: usize, hd: usize, scale: f32) -> Result<()> {
+pub fn draft_attn(b: &mut CudaBackend, q: u64, kring: u64, vring: u64, hpos: u64, cap: usize, knode: u64, vnode: u64, anc: u64, pos: u64, window: usize, out: u64, m: usize, h: usize, hd: usize, scale: f32) -> Result<()> {
     use Arg::{F, I, P};
-    let smem = ((hd + nwin + DRAFT_ANCESTORS + 1) * 4) as u32;
-    let func = b.kernels.function_smem("train", "head_attn_draft", smem)?;
-    Launch { func, grid: ((m * h) as u32, 1, 1), block: 256, smem, args: vec![P(q), P(kwin), P(vwin), I(nwin as i32), P(kanc), P(vanc), P(anc), P(out), I(h as i32), I(hd as i32), F(scale)] }.run(&b.stream)
+    let smem = ((hd + cap + DRAFT_ANCESTORS) * 4) as u32;
+    let func = b.kernels.function_smem("train", "draft_attn", smem)?;
+    Launch { func, grid: ((m * h) as u32, 1, 1), block: 256, smem, args: vec![P(q), P(kring), P(vring), P(hpos), I(cap as i32), P(knode), P(vnode), P(anc), P(pos), I(window as i32), P(out), I(h as i32), I(hd as i32), F(scale)] }.run(&b.stream)
+}
+
+/// Soft target cross entropy of rows of v logits against packed candidate rows through a vocabulary lookup,
+/// weighted per row, every row's own loss into losses, the weighted loss added into loss, the rows with a target
+/// into counted, and the weight times softmax minus target into dz
+#[allow(clippy::too_many_arguments)]
+pub fn soft_ce(b: &mut CudaBackend, z: u64, v: usize, cands: u64, lut: u64, w: u64, dz: u64, losses: u64, loss: u64, counted: u64, rows: usize) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "soft_ce", (rows as u32, 1, 1), 256, vec![P(z), I(v as i32), P(cands), I(SOFT_K as i32), P(lut), P(w), P(dz), P(losses), P(loss), P(counted)])
+}
+
+/// Acceptance and rejection cost of every row's drafted position against its packed candidates, the end column
+/// left out of the cost, see edr_terms in train.cu
+#[allow(clippy::too_many_arguments)]
+pub fn edr_terms(b: &mut CudaBackend, z: u64, v: usize, cands: u64, lut: u64, eos: i32, a: u64, c: u64, rows: usize) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "edr_terms", (rows as u32, 1, 1), 256, vec![P(z), I(v as i32), P(cands), I(SOFT_K as i32), P(lut), I(eos), P(a), P(c)])
+}
+
+/// Gradient of every row's share of the expected rounds into dz, scaled by w, given its occupancy and the rounds
+/// its acceptance saves
+#[allow(clippy::too_many_arguments)]
+pub fn edr_grad(b: &mut CudaBackend, z: u64, v: usize, cands: u64, lut: u64, eos: i32, omega: u64, dv: u64, w: u64, dz: u64, rows: usize) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "edr_grad", (rows as u32, 1, 1), 256, vec![P(z), I(v as i32), P(cands), I(SOFT_K as i32), P(lut), I(eos), P(omega), P(dv), P(w), P(dz)])
+}
+
+/// The block verification loss of every row's depth drafted positions, the positions' logits step_stride floats
+/// apart and their candidates cand_stride apart, the path columns truth_stride apart, the gradient times w added
+/// into dz and the loss into losses
+#[allow(clippy::too_many_arguments)]
+pub fn bv_row(b: &mut CudaBackend, z: u64, v: usize, step_stride: usize, cands: u64, cand_stride: usize, truth: u64, truth_stride: usize, lut: u64, depth: usize, w: u64, dz: u64, losses: u64, rows: usize) -> Result<()> {
+    use Arg::{I, L, P};
+    ensure!(depth <= kf_core::DRAFT_DEPTH, "{depth} drafted positions past {}", kf_core::DRAFT_DEPTH);
+    launch(b, "bv_row", (rows as u32, 1, 1), 256, vec![P(z), I(v as i32), L(step_stride as i64), P(cands), I(SOFT_K as i32), L(cand_stride as i64), P(truth), I(truth_stride as i32), P(lut), I(depth as i32), P(w), P(dz), P(losses)])
+}
+
+/// One optimistic AdamW step over n parameters at step t, u holding the last direction
+#[allow(clippy::too_many_arguments)]
+pub fn adamw_opt(b: &mut CudaBackend, p: u64, g: u64, m: u64, v: u64, u: u64, n: usize, lr: f32, b1: f32, b2: f32, eps: f32, wd: f32, t: i32) -> Result<()> {
+    use Arg::{F, I, L, P};
+    launch(b, "adamw_opt", (grid_for(n), 1, 1), 256, vec![P(p), P(g), P(m), P(v), P(u), L(n as i64), F(lr), F(b1), F(b2), F(eps), F(wd), I(t)])
+}
+
+/// out = the weighted sum of up to four buffers of n values
+pub fn mix4(b: &mut CudaBackend, out: u64, srcs: &[u64], weights: &[f32], n: usize) -> Result<()> {
+    use Arg::{F, L, P};
+    ensure!(!srcs.is_empty() && srcs.len() <= 4 && srcs.len() == weights.len(), "{} buffers to mix", srcs.len());
+    let at = |i: usize| srcs.get(i).copied().unwrap_or(0);
+    let wt = |i: usize| weights.get(i).copied().unwrap_or(0.0);
+    launch(b, "mix4", (grid_for(n), 1, 1), 256, vec![P(out), P(at(0)), P(at(1)), P(at(2)), P(at(3)), F(wt(0)), F(wt(1)), F(wt(2)), F(wt(3)), L(n as i64)])
+}
+
+/// y = a y + (1 - a) x over n values
+pub fn ema(b: &mut CudaBackend, y: u64, x: u64, n: usize, a: f32) -> Result<()> {
+    use Arg::{F, L, P};
+    launch(b, "ema", (grid_for(n), 1, 1), 256, vec![P(y), P(x), L(n as i64), F(a)])
+}
+
+/// The columns of a row major k by n matrix as n q8_0 rows of k into dst
+pub fn quant_q8_0_t(b: &mut CudaBackend, src: u64, dst: u64, k: usize, n: usize) -> Result<()> {
+    use Arg::{I, P};
+    ensure!(k.is_multiple_of(32), "{k} inputs for int8 rows of 32");
+    launch(b, "quant_q8_0_t", (n.div_ceil(128) as u32, (k / 32) as u32, 1), 128, vec![P(src), P(dst), I(k as i32), I(n as i32)])
+}
+
+/// Predictive entropy of every row of v logits into out
+pub fn row_entropy(b: &mut CudaBackend, z: u64, v: usize, out: u64, rows: usize) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "row_entropy", (rows as u32, 1, 1), 256, vec![P(z), I(v as i32), P(out)])
+}
+
+/// Adds n_sel rows of src, those idx names in order, into the block rows of z from slot off
+#[allow(clippy::too_many_arguments)]
+pub fn cal_accum(b: &mut CudaBackend, src: u64, idx: u64, n_sel: usize, off: usize, block: usize, z: u64, d: usize) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "cal_accum", (grid_for(d), 1, 1), 256, vec![P(src), P(idx), I(n_sel as i32), I(off as i32), I(block as i32), P(z), I(d as i32)])
+}
+
+/// out[c] += the sum over rows of x[r][c]
+pub fn col_sum(b: &mut CudaBackend, x: u64, rows: usize, cols: usize, out: u64) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "col_sum", (grid_for(cols), 1, 1), 256, vec![P(x), I(rows as i32), I(cols as i32), P(out)])
+}
+
+/// dst[r][off + c] = src[r][c] for rows of cols, dst rows stride floats apart
+pub fn copy_cols(b: &mut CudaBackend, src: u64, dst: u64, rows: usize, cols: usize, stride: usize, off: usize) -> Result<()> {
+    use Arg::{I, L, P};
+    launch(b, "copy_cols", (grid_for(rows * cols), 1, 1), 256, vec![P(src), P(dst), I(rows as i32), I(cols as i32), L(stride as i64), I(off as i32)])
+}
+
+/// Copies n node rows' keys and values into a slot's position ring at the positions given
+#[allow(clippy::too_many_arguments)]
+pub fn ring_write(b: &mut CudaBackend, k: u64, v: u64, rows: u64, pos: u64, n: usize, cap: usize, d: usize, kring: u64, vring: u64, hpos: u64) -> Result<()> {
+    use Arg::{I, P};
+    launch(b, "ring_write", (grid_for(n * d), 1, 1), 256, vec![P(k), P(v), P(rows), P(pos), I(n as i32), I(cap as i32), I(d as i32), P(kring), P(vring), P(hpos)])
 }
 
 /// Rows of bytes gathered by index

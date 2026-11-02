@@ -28,6 +28,20 @@ unsafe fn dot_avx2<const R: usize>(src: &[u8], x: &ActI8, r0: usize, y: &mut [f3
     }
 }
 
+/// Quantizes one row of whole blocks of 32 into q8_0 bytes, each block's scale the largest magnitude over 127 as
+/// f16 and its integers the values over that scale rounded to nearest even
+pub fn quantize_row(x: &[f32], dst: &mut [u8]) {
+    for (blk, out) in x.chunks_exact(32).zip(dst.chunks_exact_mut(34)) {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out[..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        for (o, v) in out[2..].iter_mut().zip(blk) {
+            *o = ((v * id).round_ties_even() as i32).clamp(-127, 127) as i8 as u8;
+        }
+    }
+}
+
 impl Quant for Q8_0 {
     fn info(&self) -> &'static TypeInfo {
         &INFO

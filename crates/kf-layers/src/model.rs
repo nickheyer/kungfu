@@ -68,7 +68,7 @@ impl Model {
 
     /// Emits the whole forward pass and returns logits for the last n_out tokens
     pub fn logits(&self, g: &mut GraphBuilder, n_tokens: usize, n_out: usize) -> Result<Tid> {
-        self.segment(g, n_tokens, Segment::whole(self.n_layers(), n_out))
+        self.segment(g, n_tokens, Segment::whole(self.n_layers(), n_out), &[])
     }
 
     /// Whether any block hands tensors to later blocks, which no cut between blocks can carry
@@ -102,7 +102,7 @@ impl Model {
     }
 
     /// Emits one segment, scaled token embeddings or unscaled injected rows through the range's blocks, then the head when asked
-    pub fn segment(&self, g: &mut GraphBuilder, n_tokens: usize, seg: Segment) -> Result<Tid> {
+    pub fn segment(&self, g: &mut GraphBuilder, n_tokens: usize, seg: Segment, taps: &[usize]) -> Result<Tid> {
         let n_layers = self.n_layers();
         if seg.from > seg.to || seg.to > n_layers {
             bail!("segment {}..{} of a {n_layers} layer model", seg.from, seg.to);
@@ -138,6 +138,7 @@ impl Model {
             ctx.embed = e;
             g.input("hidden")
         };
+        let mut tapped: Vec<(usize, Tid)> = Vec::with_capacity(taps.len());
         for block in self.blocks.iter().filter(|b| b.layer >= seg.from && b.layer < seg.to) {
             ctx.layer = block.layer;
             ctx.block_input = x;
@@ -146,16 +147,26 @@ impl Model {
             for part in &block.parts {
                 x = part.forward(g, x, &ctx)?;
             }
+            if taps.contains(&block.layer) {
+                tapped.push((block.layer, x));
+            }
         }
         g.layer = None;
         let Some(n_out) = seg.n_out else { return Ok(x) };
         if n_out < n_tokens {
             x = g.push(Op::LastRows { n: n_out }, &[x]);
+            for (_, t) in tapped.iter_mut() {
+                *t = g.push(Op::LastRows { n: n_out }, &[*t]);
+            }
         }
         if let Some(p) = &self.pre_head {
             x = p.forward(g, x, &ctx)?;
         }
         g.keep_hidden(x);
+        tapped.sort_by_key(|(l, _)| *l);
+        for (_, t) in tapped {
+            g.keep_tap(t);
+        }
         let x = self.final_norm.forward(g, x, &ctx)?;
         let mut l = self.head.apply(g, x);
         l = g.scale(l, self.logit_scale);
@@ -170,6 +181,12 @@ impl Model {
 
     pub fn n_layers(&self) -> usize {
         self.blocks.iter().map(|b| b.layer + 1).max().unwrap_or(0)
+    }
+
+    /// m tap layers spread evenly through the model, the last layer the last of them
+    pub fn even_taps(&self, m: usize) -> Vec<usize> {
+        let n = self.n_layers();
+        (1..=m.max(1)).map(|i| (i * n).div_ceil(m.max(1)).saturating_sub(1).min(n.saturating_sub(1))).collect()
     }
 
     pub fn weights(&self) -> Vec<Wid> {

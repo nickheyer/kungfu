@@ -345,6 +345,8 @@ pub struct Graph {
     pub output: Option<Tid>,
     /// The residual rows before the final norm, one per row of logits, kept through the pass for a draft head to read
     pub hidden: Option<Tid>,
+    /// The residual rows after each tap layer, one per kept hidden row, the draft block's features in order
+    pub taps: Vec<Tid>,
     next: u32,
 }
 
@@ -429,5 +431,10 @@ impl GraphBuilder {
     /// Marks the residual rows before the final norm as the hidden rows the pass keeps
     pub fn keep_hidden(&mut self, t: Tid) {
         self.graph.hidden = Some(t);
+    }
+
+    /// Adds the residual rows after one tap layer to the tap rows the pass keeps
+    pub fn keep_tap(&mut self, t: Tid) {
+        self.graph.taps.push(t);
     }
 }

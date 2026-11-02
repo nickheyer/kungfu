@@ -1,6 +1,6 @@
 //! Device time of single kernels, the measurement the tuning loop runs against
 use crate::CudaBackend;
-use crate::exec::{Arg, Launch, MATVEC_ROWS, MATVEC_THREADS, act_args, dev_alloc, dev_upload, dptr, matvec_i8_launch, matvec_rows, mm_i8_fits, quant_launch, round_code, row_bytes, topk_launches, topk_slices};
+use crate::exec::{Arg, Launch, MATVEC_ROWS, MATVEC_THREADS, Multi, act_args, dev_alloc, dev_upload, dptr, frag_launch, matvec_i8_launch, matvec_rows, multi_kind, quant_launch, round_code, row_bytes, topk_launches, topk_slices};
 use crate::kf8::{Form, Ptrs, Store, act_scratch};
 use crate::kf8::Tile;
 use anyhow::{Context, Result, ensure};
@@ -23,6 +23,12 @@ fn time_us(b: &CudaBackend, l: &Launch, iters: usize) -> Result<f64> {
 /// Device microseconds of the int8 product of rows of activations against a weight given as native bytes of a block
 /// type, the tensor core tile past eight rows and the matvec up to it, then the microseconds of the unpack into KF8
 pub fn product_us(b: &mut CudaBackend, ty: u32, bytes: &[u8], rows: usize, n_in: usize, n_out: usize, iters: usize) -> Result<(f64, f64)> {
+    product_kind_us(b, ty, bytes, rows, n_in, n_out, iters, None)
+}
+
+/// product_us with the few row family forced to kind when given, the shape's own choice otherwise
+#[allow(clippy::too_many_arguments)]
+pub fn product_kind_us(b: &mut CudaBackend, ty: u32, bytes: &[u8], rows: usize, n_in: usize, n_out: usize, iters: usize, kind: Option<Multi>) -> Result<(f64, f64)> {
     b.ctx.bind_to_thread()?;
     let pool = b.pool();
     let rb = row_bytes(ty, n_in)? as i64;
@@ -34,12 +40,12 @@ pub fn product_us(b: &mut CudaBackend, ty: u32, bytes: &[u8], rows: usize, n_in:
     let code = round_code(ty)?;
     let x: Vec<f32> = (0..rows * n_in).map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).collect();
     let xb = dev_upload(&b.stream, pool, &x, AllocKind::Compute, "bench x")?;
-    let xq = dev_alloc::<f32>(&b.stream, pool, rows * n_in, AllocKind::Compute, "bench xq")?;
+    let xq = dev_alloc::<u8>(&b.stream, pool, crate::kf8::act_scratch_bytes(rows, n_in), AllocKind::Compute, "bench xq")?;
     let y = dev_alloc::<f32>(&b.stream, pool, rows * n_out, AllocKind::Compute, "bench y")?;
     let (xq_ptr, y_ptr) = (dptr(&xq, &b.stream), dptr(&y, &b.stream));
     quant_launch(&mut b.kernels, dptr(&xb, &b.stream), xq_ptr, rows, n_in, code)?.run(&b.stream)?;
     if rows <= matvec_rows(ty, n_in, &[]) {
-        let l = matvec_i8_launch(&mut b.kernels, ty, w_ptr, xq_ptr, 0, 0, y_ptr, rows, n_in, n_out, rb, 0, 0, mm_i8_fits(ty, n_in, &[]))?;
+        let l = matvec_i8_launch(&mut b.kernels, ty, w_ptr, xq_ptr, 0, 0, y_ptr, rows, n_in, n_out, rb, 0, 0, kind.unwrap_or_else(|| multi_kind(ty, n_in, &[])))?;
         return Ok((time_us(b, &l, iters)?, 0.0));
     }
     let (q, scales, sums) = act_scratch(xq_ptr, rows, n_in, f.g);
@@ -50,6 +56,35 @@ pub fn product_us(b: &mut CudaBackend, ty: u32, bytes: &[u8], rows: usize, n_in:
     let gemm = b.res.kf8.gemm(&mut b.kernels, &f, p, q, scales, sums, 0, 0, y_ptr, rows, 0, 0)?;
     let t_gemm = time_us(b, &gemm, iters)?;
     Ok((t_gemm, t_unpack))
+}
+
+/// Device microseconds of the fragment product compiled from the type's quant module source with defines prepended,
+/// stages and warps being the KF_FRAG_STAGES and KF_FRAG_WARPS the defines set
+#[allow(clippy::too_many_arguments)]
+pub fn frag_variant_us(b: &mut CudaBackend, defines: &str, stages: Option<usize>, warps: Option<usize>, ty: u32, bytes: &[u8], rows: usize, n_in: usize, n_out: usize, iters: usize) -> Result<f64> {
+    b.ctx.bind_to_thread()?;
+    let pool = b.pool();
+    let rb = row_bytes(ty, n_in)? as i64;
+    ensure!(bytes.len() == rb as usize * n_out, "{} bytes for {n_out} rows of {rb}", bytes.len());
+    let module = crate::sources::quant_module(ty).context("quant module")?;
+    let mut h = Sha256::new();
+    h.update(defines.as_bytes());
+    let name = format!("{module}v_{:x}", u64::from_le_bytes(h.finalize()[..8].try_into().expect("hash bytes")));
+    if !b.kernels.has_module(&name) {
+        let src = format!("{defines}\n{}", crate::sources::module_source(&module).context("quant source")?);
+        b.kernels.load(&name, &src)?;
+    }
+    let w = dev_upload(&b.stream, pool, bytes, AllocKind::Weights, "bench weight")?;
+    let w_ptr = dptr(&w, &b.stream);
+    let code = round_code(ty)?;
+    let x: Vec<f32> = (0..rows * n_in).map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).collect();
+    let xb = dev_upload(&b.stream, pool, &x, AllocKind::Compute, "bench x")?;
+    let xq = dev_alloc::<u8>(&b.stream, pool, crate::kf8::act_scratch_bytes(rows, n_in), AllocKind::Compute, "bench xq")?;
+    let y = dev_alloc::<f32>(&b.stream, pool, rows * n_out, AllocKind::Compute, "bench y")?;
+    let (xq_ptr, y_ptr) = (dptr(&xq, &b.stream), dptr(&y, &b.stream));
+    quant_launch(&mut b.kernels, dptr(&xb, &b.stream), xq_ptr, rows, n_in, code)?.run(&b.stream)?;
+    let l = frag_launch(&mut b.kernels, &name, ty, w_ptr, xq_ptr, 0, 0, y_ptr, rows, n_in, n_out, rb, 0, 0, stages, warps)?;
+    time_us(b, &l, iters)
 }
 
 /// Device microseconds of the top k kernel compiled from the sample module source with defines prepended, over rows of
@@ -96,7 +131,7 @@ pub fn gemm_variant_us(b: &mut CudaBackend, defines: &str, ty: u32, bytes: &[u8]
     let code = round_code(ty)?;
     let x: Vec<f32> = (0..rows * n_in).map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).collect();
     let xb = dev_upload(&b.stream, pool, &x, AllocKind::Compute, "bench x")?;
-    let xq = dev_alloc::<f32>(&b.stream, pool, rows * n_in, AllocKind::Compute, "bench xq")?;
+    let xq = dev_alloc::<u8>(&b.stream, pool, crate::kf8::act_scratch_bytes(rows, n_in), AllocKind::Compute, "bench xq")?;
     let y = dev_alloc::<f32>(&b.stream, pool, rows * n_out, AllocKind::Compute, "bench y")?;
     let (xq_ptr, y_ptr) = (dptr(&xq, &b.stream), dptr(&y, &b.stream));
     quant_launch(&mut b.kernels, dptr(&xb, &b.stream), xq_ptr, rows, n_in, code)?.run(&b.stream)?;
@@ -147,7 +182,7 @@ pub fn gemmk_us(b: &mut CudaBackend, src: &str, defines: &str, g: usize, has_m: 
     let db = dev_upload(&b.stream, pool, &d, AllocKind::Weights, "bench k8 d")?;
     let dmb = dev_upload(&b.stream, pool, &d, AllocKind::Weights, "bench k8 dmin")?;
     let xb = dev_upload(&b.stream, pool, &x, AllocKind::Compute, "bench x")?;
-    let xq = dev_alloc::<f32>(&b.stream, pool, rows * n_in, AllocKind::Compute, "bench xq")?;
+    let xq = dev_alloc::<u8>(&b.stream, pool, crate::kf8::act_scratch_bytes(rows, n_in), AllocKind::Compute, "bench xq")?;
     let y = dev_alloc::<f32>(&b.stream, pool, rows * n_out, AllocKind::Compute, "bench y")?;
     let (xq_ptr, y_ptr) = (dptr(&xq, &b.stream), dptr(&y, &b.stream));
     quant_launch(&mut b.kernels, dptr(&xb, &b.stream), xq_ptr, rows, n_in, 4)?.run(&b.stream)?;
@@ -255,11 +290,11 @@ pub fn matvec_variant_us(b: &mut CudaBackend, defines: &str, ty: u32, bytes: &[u
     let code = round_code(ty)?;
     let x: Vec<f32> = (0..rows * n_in).map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).collect();
     let xb = dev_upload(&b.stream, pool, &x, AllocKind::Compute, "bench x")?;
-    let xq = dev_alloc::<f32>(&b.stream, pool, rows * n_in, AllocKind::Compute, "bench xq")?;
+    let xq = dev_alloc::<u8>(&b.stream, pool, crate::kf8::act_scratch_bytes(rows, n_in), AllocKind::Compute, "bench xq")?;
     let y = dev_alloc::<f32>(&b.stream, pool, rows * n_out, AllocKind::Compute, "bench y")?;
     let (xq_ptr, y_ptr) = (dptr(&xq, &b.stream), dptr(&y, &b.stream));
     quant_launch(&mut b.kernels, dptr(&xb, &b.stream), xq_ptr, rows, n_in, code)?.run(&b.stream)?;
-    let [q, s16, m16, s32, m32] = crate::kf8::act_scratch_all(xq_ptr, rows, n_in);
+    let [q, s16, m16, s32, m32, _] = crate::kf8::act_scratch_all(xq_ptr, rows, n_in);
     let module = crate::sources::quant_module(ty).context("quant module")?;
     let mut h = Sha256::new();
     h.update(module.as_bytes());

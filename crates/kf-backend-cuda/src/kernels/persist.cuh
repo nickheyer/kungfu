@@ -205,7 +205,7 @@ __device__ __noinline__ void kf_ps_rms_q8(const KfPsRms& a, int row, int spanb, 
     s = kf_block_sum(s, scratch);
     if (span >= a.n) return;
     const float inv = 1.0f / sqrtf(s / (float)a.n + a.eps);
-    const KfActRow o = kf_act_row(a.q, a.s16, a.m16, a.s32, a.m32, row, a.n);
+    const KfActRow o = kf_act_row(a.q, a.s16, a.m16, a.s32, a.m32, row, a.n, 0);
     const int c0 = span + lane * 8;
     float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (c0 < a.n) {
@@ -225,7 +225,7 @@ __device__ __noinline__ void kf_ps_gated_q8(const KfPsGated& a, int row, int spa
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int span = spanb * KF_QUANT_SPAN + warp * 256;
     if (span >= a.n) return;
-    const KfActRow o = kf_act_row(a.q, a.s16, a.m16, a.s32, a.m32, row, a.n);
+    const KfActRow o = kf_act_row(a.q, a.s16, a.m16, a.s32, a.m32, row, a.n, 0);
     const int c0 = span + lane * 8;
     float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (c0 < a.n) {
@@ -317,6 +317,8 @@ __device__ __forceinline__ void kf_ps_stage_pre(const KfPsMv& a, int pre, const 
     o.m16 = o.s16 + (n >> 4);
     o.s32 = o.m16 + (n >> 4);
     o.m32 = o.s32 + (n >> 5);
+    o.xa = nullptr;
+    o.xa_rt = o.xa_gid = 0;
     if (pre == KF_PS_PRE_RMS) {
         const KfPsRms& r = *reinterpret_cast<const KfPsRms*>(pre_args);
         float s = 0.0f;

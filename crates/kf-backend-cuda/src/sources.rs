@@ -5,6 +5,7 @@ pub const HEADERS: &[(&str, &str)] = &[
     ("common.cuh", include_str!("kernels/common.cuh")),
     ("quant.cuh", include_str!("kernels/quant.cuh")),
     ("mm_i8.cuh", include_str!("kernels/mm_i8.cuh")),
+    ("mm_frag.cuh", include_str!("kernels/mm_frag.cuh")),
     ("grids.cuh", include_str!("kernels/grids.cuh")),
     ("kf8.cu", include_str!("kernels/kf8.cu")),
     ("attention_decode.cuh", include_str!("kernels/attention_decode.cuh")),
@@ -99,6 +100,21 @@ pub fn matvec_cols(ggml_type: u32) -> usize {
         Some("q4_K" | "q5_K" | "q6_K") => 64,
         Some("q8_0") => 32,
         _ => 16,
+    }
+}
+
+/// Whether a ggml type has the fragment product plan, see mm_frag.cuh
+pub fn has_frag(ggml_type: u32) -> bool {
+    frag_plan(ggml_type).is_some()
+}
+
+/// Shared memory pitch of one weight row of a super block, the ring stages per warp, and the warps per block of the
+/// fragment product, the PITCH, STAGES and WARPS of the type's KfFrag
+pub fn frag_plan(ggml_type: u32) -> Option<(usize, usize, usize)> {
+    match kf_quant::info(ggml_type).map(|i| i.name) {
+        Some("q4_K") => Some((160, 2, 8)),
+        Some("q6_K") => Some((240, 2, 4)),
+        _ => None,
     }
 }
 

@@ -1,10 +1,9 @@
 //! CUDA backend, kernels are CUDA C compiled through NVRTC and cached as PTX
 pub mod bench;
 mod coproc;
-pub mod drafter;
+pub mod draft;
 mod exec;
 mod experts;
-pub mod features;
 mod kf8;
 mod persist;
 mod registry;
@@ -19,7 +18,27 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use exec::Multi;
 pub use registry::{KernelRef, KernelRegistry, cuda_kernel_for_op};
+
+/// The device address of a slice on the backend's stream
+pub fn device_ptr<T>(s: &CudaSlice<T>, b: &CudaBackend) -> u64 {
+    exec::dptr(s, &b.stream)
+}
+
+/// A device slice of integers brought to the host after the stream drains
+pub fn download_i32(s: &CudaSlice<i32>, b: &CudaBackend) -> Result<Vec<i32>> {
+    let mut out = vec![0i32; s.len()];
+    exec::dtoh(&b.stream, &mut out, exec::dptr(s, &b.stream))?;
+    Ok(out)
+}
+
+/// A device slice of bytes brought to the host after the stream drains
+pub fn download_u8(s: &CudaSlice<u8>, b: &CudaBackend) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; s.len()];
+    exec::dtoh(&b.stream, &mut out, exec::dptr(s, &b.stream))?;
+    Ok(out)
+}
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -62,14 +81,14 @@ pub struct CudaBackend {
     dense: Option<exec::Output>,
     /// The residual rows before the final norm the last pass kept
     hidden: Option<exec::Output>,
-    /// The rows the passes scored, for the draft head, made with the first pass that keeps hidden rows
-    pub ring: Option<features::FeatureRing>,
-    /// The slot and token of every row of the last tree pass, which compaction appends to the ring along the kept path
-    tree_tokens: Vec<(u32, u32)>,
-    /// The draft head, once started
-    drafter: Option<drafter::Drafter>,
-    /// The model's vocabulary and the draft vocabulary's size, set when the drafter starts
-    draft_vocab: (usize, usize),
+    /// The residual rows after every tap layer the last pass kept, in the graph's order
+    taps: Vec<exec::Output>,
+    /// Layer statistics the tap selection collects, while it does
+    cal: Option<draft::Calibration>,
+    /// The packed candidate rows the last pass ended in, when it ended in a top k
+    cands: Option<exec::Output>,
+    /// The draft block, once started
+    draft: Option<draft::Drafter>,
     pending: Option<anyhow::Error>,
     captures: u64,
     replays: u64,
@@ -82,6 +101,16 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// The gradients of the draft block's first learner over one batch of its ring, what parity tests compare
+    #[doc(hidden)]
+    pub fn draft_probe_grads(&mut self) -> Result<Option<Vec<Vec<f32>>>> {
+        self.ctx.bind_to_thread()?;
+        let Some(mut d) = self.draft.take() else { anyhow::bail!("no draft block") };
+        let r = d.probe_grads(self);
+        self.draft = Some(d);
+        r
+    }
+
     /// Opens a device, PTX compiled through NVRTC is cached under the cache directory when one is given
     pub fn new(ordinal: usize, cache_dir: Option<&Path>) -> Result<Self> {
         let ctx = CudaContext::new(ordinal).with_context(|| format!("cuda device {ordinal}"))?;
@@ -105,10 +134,9 @@ impl CudaBackend {
             last: None,
             dense: None,
             hidden: None,
-            ring: None,
-            tree_tokens: Vec::new(),
-            drafter: None,
-            draft_vocab: (0, 0),
+            taps: Vec::new(), cal: None,
+            cands: None,
+            draft: None,
             pending: None,
             captures: 0,
             replays: 0,
@@ -142,11 +170,15 @@ impl CudaBackend {
         Pool::Device(self.ctx.ordinal() as u32)
     }
 
-    /// Makes the feature ring that every pass's hidden rows of this width join from now on
-    pub fn start_ring(&mut self, cols: usize) -> Result<()> {
-        let ring = features::FeatureRing::new(self, features::RING_ROWS, cols, self.host.n_seq())?;
-        self.ring = Some(ring);
-        Ok(())
+    /// Ends the draft block's runs and history of one slot or of every slot, after their rows rolled back
+    fn draft_roll_back(&mut self, seq: Option<usize>) -> Result<()> {
+        let Some(mut d) = self.draft.take() else { return Ok(()) };
+        let r = match seq {
+            Some(s) => d.roll_back(self, s),
+            None => (0..self.host.n_seq()).try_for_each(|s| d.roll_back(self, s)),
+        };
+        self.draft = Some(d);
+        r
     }
 
     /// A zeroed device buffer of n elements accounted to a kind
@@ -155,7 +187,7 @@ impl CudaBackend {
     }
 
     /// A device copy of host data accounted to a kind
-    pub(crate) fn upload<T: cudarc::driver::DeviceRepr + Unpin>(&self, data: &[T], kind: AllocKind, what: &str) -> Result<CudaSlice<T>> {
+    pub fn upload<T: cudarc::driver::DeviceRepr + Unpin>(&self, data: &[T], kind: AllocKind, what: &str) -> Result<CudaSlice<T>> {
         exec::dev_upload(&self.stream, self.pool(), data, kind, what)
     }
 
@@ -194,74 +226,68 @@ impl Backend for CudaBackend {
         exec::hidden_rows(self)
     }
 
-    fn drafter_start(&mut self, cfg: kf_core::HeadConfig, embed: kf_core::Wid, head: kf_core::Wid, n_vocab: usize, draft_vocab: usize, batch: usize, weights: &dyn WeightSource) -> Result<()> {
+    fn tap_rows(&mut self) -> Result<Vec<f32>> {
+        exec::tap_rows(self)
+    }
+
+    fn draft_calibrate(&mut self, n_layers: usize) -> Result<()> {
+        anyhow::ensure!(n_layers >= 1, "a tap selection over no layers");
+        self.cal = Some(draft::Calibration::new(n_layers));
+        Ok(())
+    }
+
+    fn draft_calibrated(&self) -> u64 {
+        self.cal.as_ref().map_or(0, |c| c.retained)
+    }
+
+    fn draft_select_taps(&mut self, m: usize, cka: bool) -> Result<Vec<usize>> {
+        self.ctx.bind_to_thread()?;
+        let cal = self.cal.take().ok_or_else(|| anyhow::anyhow!("no tap statistics were collected"))?;
+        anyhow::ensure!(cal.retained >= kf_core::DRAFT_CAL_BLOCK as u64, "{} rows kept for the tap selection, at least {} are needed", cal.retained, kf_core::DRAFT_CAL_BLOCK);
+        cal.select(self, m, cka)
+    }
+
+    fn draft_start(&mut self, cfg: kf_core::DraftConfig, tap_layers: &[usize], embed: kf_core::Wid, head: kf_core::Wid, norm: kf_core::Wid, n_vocab: usize, eos: Option<u32>, draft_vocab: usize, batch: usize, weights: &dyn kf_core::WeightSource) -> Result<()> {
         self.ctx.bind_to_thread()?;
         let n_seq = self.host.n_seq();
-        self.start_ring(cfg.d)?;
-        let d = drafter::Drafter::new(self, cfg, batch, n_seq, embed, head, weights)?;
-        self.drafter = Some(d);
-        self.draft_vocab = (n_vocab, draft_vocab.clamp(1, n_vocab));
-        self.drafter_refresh_vocab()
+        let d = draft::Drafter::new(self, cfg, tap_layers.to_vec(), batch, n_seq, embed, head, norm, n_vocab, eos, draft_vocab, weights)?;
+        self.draft = Some(d);
+        Ok(())
     }
 
-    fn drafter_step(&mut self) -> Result<Option<kf_core::TrainStep>> {
-        let Some(mut d) = self.drafter.take() else { return Ok(None) };
+    fn draft_step(&mut self) -> Result<Option<kf_core::TrainStep>> {
+        let Some(mut d) = self.draft.take() else { return Ok(None) };
         let r = d.step(self);
-        self.drafter = Some(d);
+        self.draft = Some(d);
         r
     }
 
-    fn drafter_rows(&self) -> u64 {
-        self.ring.as_ref().map_or(0, |r| r.appended)
+    fn draft_rows(&self) -> u64 {
+        self.draft.as_ref().map_or(0, |d| d.ring.meta.appended)
     }
 
-    fn drafter_hold(&mut self, seq: usize, row: usize, pos: u32) -> Result<()> {
-        let Some(mut d) = self.drafter.take() else { return Ok(()) };
-        let r = (|| {
-            let h = self.hidden.ok_or_else(|| anyhow::anyhow!("the last pass kept no hidden rows"))?;
-            anyhow::ensure!(row < h.rows, "row {row} of {} hidden rows", h.rows);
-            d.hold(self, seq, h.ptr + (row * h.cols * 4) as u64, pos)
-        })();
-        self.drafter = Some(d);
+    fn draft_tree(&mut self, seq: usize, path: &[usize], root: u32, rows: usize) -> Result<kf_core::Tree> {
+        let Some(mut d) = self.draft.take() else { anyhow::bail!("no draft block") };
+        let r = d.draft_tree(self, seq, path, root, rows);
+        self.draft = Some(d);
         r
     }
 
-    fn drafter_sync(&mut self, seq: usize) -> Result<()> {
-        let Some(mut d) = self.drafter.take() else { return Ok(()) };
-        let r = d.sync(self, seq);
-        self.drafter = Some(d);
+    fn draft_refresh_vocab(&mut self) -> Result<()> {
+        let Some(mut d) = self.draft.take() else { anyhow::bail!("no draft block") };
+        let r = d.refresh_vocab(self);
+        self.draft = Some(d);
         r
     }
 
-    fn drafter_draft(&mut self, seq: usize, own: u32, budget: usize) -> Result<kf_core::Tree> {
-        let Some(mut d) = self.drafter.take() else { return Ok(kf_core::Tree::root(own)) };
-        let r = d.draft(self, seq, own, budget);
-        self.drafter = Some(d);
-        r
+    fn draft_save(&mut self) -> Result<Vec<u8>> {
+        self.draft.as_ref().ok_or_else(|| anyhow::anyhow!("no draft block to save"))?.save(self)
     }
 
-    fn drafter_refresh_vocab(&mut self) -> Result<()> {
-        let Some(mut d) = self.drafter.take() else { return Ok(()) };
-        let (n_vocab, v) = self.draft_vocab;
-        let vocab = drafter::Drafter::vocab_from_ring(self, n_vocab, v);
-        let r = d.set_vocab(self, &vocab);
-        self.drafter = Some(d);
-        r
-    }
-
-    fn drafter_save(&mut self) -> Result<Vec<u8>> {
-        let d = self.drafter.as_ref().ok_or_else(|| anyhow::anyhow!("no draft head to save"))?;
-        Ok(kf_core::head_save(&d.trainer.head.cfg, &d.vocab, &d.trainer.head.params_host(self)?))
-    }
-
-    fn drafter_load(&mut self, bytes: &[u8]) -> Result<()> {
-        let Some(mut d) = self.drafter.take() else { anyhow::bail!("no draft head to load into") };
-        let r = (|| {
-            let (vocab, params) = kf_core::head_load(&d.trainer.head.cfg, bytes)?;
-            d.trainer.head.set_params(self, &params)?;
-            d.set_vocab(self, &vocab)
-        })();
-        self.drafter = Some(d);
+    fn draft_load(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some(mut d) = self.draft.take() else { anyhow::bail!("no draft block to load into") };
+        let r = d.load(self, bytes);
+        self.draft = Some(d);
         r
     }
 
@@ -270,35 +296,19 @@ impl Backend for CudaBackend {
     }
 
     fn truncate(&mut self, seq: usize, n: usize) -> Result<()> {
-        if let Some(r) = self.ring.as_mut() {
-            r.roll_back(seq);
-        }
-        if let Some(d) = self.drafter.as_mut() {
-            d.forget(seq);
-        }
+        self.draft_roll_back(Some(seq))?;
         cuda_truncate_state(self, seq, n)
     }
 
     fn reset(&mut self) {
-        if let Some(r) = self.ring.as_mut() {
-            r.roll_back_all();
-        }
-        if let Some(d) = self.drafter.as_mut() {
-            for seq in 0..self.host.n_seq() {
-                d.forget(seq);
-            }
+        if let Err(e) = self.draft_roll_back(None) {
+            kf_core::event::error("drafter", &[("detail", format!("{e:#}"))]);
         }
         cuda_reset_state(self)
     }
 
     fn reset_seq(&mut self, seq: usize) {
-        if let Some(r) = self.ring.as_mut() {
-            r.roll_back(seq);
-        }
-        if let Some(d) = self.drafter.as_mut() {
-            d.forget(seq);
-        }
-        if let Err(e) = exec::truncate(self, Some(seq), 0) {
+        if let Err(e) = self.draft_roll_back(Some(seq)).and_then(|()| exec::truncate(self, Some(seq), 0)) {
             self.pending.get_or_insert(e);
         }
     }
@@ -308,12 +318,7 @@ impl Backend for CudaBackend {
     }
 
     fn load_state(&mut self, seq: usize, bytes: &[u8]) -> Result<()> {
-        if let Some(r) = self.ring.as_mut() {
-            r.roll_back(seq);
-        }
-        if let Some(d) = self.drafter.as_mut() {
-            d.forget(seq);
-        }
+        self.draft_roll_back(Some(seq))?;
         exec::load_state(self, seq, bytes)
     }
 
